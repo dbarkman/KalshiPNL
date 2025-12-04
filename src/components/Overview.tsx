@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { Trade } from '@/utils/processData';
+import { MatchedTrade } from '@/utils/processData';
 
 interface OverviewProps {
   stats: {
@@ -16,7 +16,7 @@ interface OverviewProps {
     winRate: number;
     settledWinRate: number;
   };
-  trades: Trade[];
+  matchedTrades: MatchedTrade[];
 }
 
 const StatCard = ({ title, value, tooltip, className = '' }: { title: string; value: string | number; tooltip: string; className?: string }) => (
@@ -30,7 +30,7 @@ const StatCard = ({ title, value, tooltip, className = '' }: { title: string; va
   </div>
 );
 
-export default function Overview({ stats, trades }: OverviewProps) {
+export default function Overview({ stats, matchedTrades }: OverviewProps) {
   const formatCurrency = (value: number) => {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
@@ -56,24 +56,14 @@ export default function Overview({ stats, trades }: OverviewProps) {
     return value.toFixed(1) + ' days';
   };
 
-  // Filter to exit trades (settlements or trades with non-zero realized revenue)
-  const exitTrades = trades.filter(t => 
-    t.Type === 'settlement' || t.Realized_Revenue > 0
-  );
+  // Calculate total risked (entry cost) and average PNL per dollar risked
+  const totalRisked = matchedTrades.reduce((sum, trade) => sum + trade.Entry_Cost, 0);
+  const totalProfit = matchedTrades.reduce((sum, trade) => sum + trade.Net_Profit, 0);
+  const avgPnlPerDollarRisked = totalRisked > 0 ? totalProfit / totalRisked : 0;
 
-  const totalRisked = exitTrades.reduce((sum, trade) => {
-    if (trade.Type === 'settlement') {
-      return sum + trade.Realized_Cost;
-    }
-    return sum + (trade.Realized_Cost - trade.Average_Price * trade.Realized_Revenue / 100);
-  }, 0);
-  const avgPnlPerDollarRisked = exitTrades.reduce((sum, trade) => {
-    return sum + trade.Realized_Profit;
-  }, 0) / totalRisked;
-
-  // Calculate profit by ticker using original trades
-  const profitByTicker = trades.reduce((acc, trade) => {
-    acc[trade.Ticker] = (acc[trade.Ticker] || 0) + trade.Realized_Profit;
+  // Calculate profit by ticker using matched trades
+  const profitByTicker = matchedTrades.reduce((acc, trade) => {
+    acc[trade.Ticker] = (acc[trade.Ticker] || 0) + trade.Net_Profit;
     return acc;
   }, {} as Record<string, number>);
 
@@ -86,23 +76,15 @@ export default function Overview({ stats, trades }: OverviewProps) {
     ? entries.reduce(([t, p], [t2, p2]) => (p2 < p ? [t2, p2] : [t, p]))
     : ['N/A', 0];
 
-  // Find highest ROI trade and its ROI value
-  const [highestROITrade, highestROI] = exitTrades.reduce<[Trade | null, number]>((best, trade) => {
+  // Find highest ROI trade
+  const [highestROITrade, highestROI] = matchedTrades.reduce<[MatchedTrade | null, number]>((best, trade) => {
     // Skip trades with zero or negative investment
-    if (trade.Realized_Cost <= 0) return best;
+    if (trade.Entry_Cost <= 0) return best;
     
-    // Calculate investment amount based on trade type
-    const investment = trade.Type === 'settlement' 
-      ? trade.Realized_Cost
-      : trade.Realized_Cost - (trade.Average_Price * trade.Realized_Revenue / 100);
-    
-    // Skip if investment is zero or negative
-    if (investment <= 0) return best;
-    
-    const currentROI = trade.Realized_Profit / investment;
+    const currentROI = trade.ROI || (trade.Net_Profit / trade.Entry_Cost);
     
     // Get previous best ROI for comparison
-    const [bestTrade, bestROI] = best;
+    const [, bestROI] = best;
     
     return currentROI > bestROI ? [trade, currentROI] : best;
   }, [null, -Infinity]);
@@ -148,7 +130,7 @@ export default function Overview({ stats, trades }: OverviewProps) {
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <StatCard 
               title="Total Trades" 
-              value={trades.length} 
+              value={matchedTrades.length} 
               tooltip="Total number of trades executed"
             />
             <StatCard 
@@ -205,7 +187,7 @@ export default function Overview({ stats, trades }: OverviewProps) {
             <StatCard 
               title="Highest ROI" 
               value={`${formatPercent(highestROI || 0)} (${highestROITrade?.Ticker || 'N/A'})`}
-              tooltip={`${formatCurrency(highestROITrade?.Realized_Profit || 0)} profit on ${formatCurrency((highestROITrade?.Realized_Cost || 0))} risked`}
+              tooltip={`${formatCurrency(highestROITrade?.Net_Profit || 0)} profit on ${formatCurrency((highestROITrade?.Entry_Cost || 0))} risked`}
               className="border-l-4 border-blue-400"
             />
           </div>

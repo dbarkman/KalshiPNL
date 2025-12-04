@@ -3,28 +3,23 @@
 import React from 'react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js';
 import { Pie } from 'react-chartjs-2';
-import { Trade } from '@/utils/processData';
+import { MatchedTrade } from '@/utils/processData';
 
 ChartJS.register(ArcElement, Tooltip, Legend);
 
 interface TradeSettlementPieProps {
-  trades: Trade[];
+  matchedTrades: MatchedTrade[];
 }
 
-export default function TradeSettlementPie({ trades }: TradeSettlementPieProps) {
-  // Filter to exit trades only
-  const exitTrades = trades.filter(trade => 
-    trade.Type === 'settlement' || trade.Realized_Revenue > 0
-  );
-  
-  // Calculate the number of contracts settled vs sold
-  const settledContracts = exitTrades
-    .filter(t => t.Type === 'settlement')
+export default function TradeSettlementPie({ matchedTrades }: TradeSettlementPieProps) {
+  // Calculate the number of contracts settled vs sold (exited early)
+  const settledContracts = matchedTrades
+    .filter(t => t.Exit_Type === 'settlement')
     .reduce((sum, t) => sum + t.Contracts, 0);
   
-  const soldContracts = exitTrades
-    .filter(t => t.Type !== 'settlement')
-    .reduce((sum, t) => sum + Math.abs(t.Realized_Revenue), 0);
+  const soldContracts = matchedTrades
+    .filter(t => t.Exit_Type !== 'settlement')
+    .reduce((sum, t) => sum + t.Contracts, 0);
 
   const data = {
     labels: ['Settled Contracts', 'Sold Contracts'],

@@ -1,14 +1,16 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import Papa from 'papaparse';
-import { processCSVData, ProcessedData, combineProcessedData } from '@/utils/processData';
+import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade } from '@/utils/processData';
 import Overview from '@/components/Overview';
 import PnlChart from './PnlChart';
 import TradeDirectionPie from './TradeDirectionPie';
 import TradeSettlementPie from './TradeSettlementPie';
+import MakerTakerPie from './MakerTakerPie';
 import RiskAdjustedReturns from './RiskAdjustedReturns';
 import TradeList from './TradeList';
+import SeriesStatsTable from './SeriesStatsTable';
 
 interface CsvData {
   headers: string[];
@@ -25,7 +27,84 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
   const [error, setError] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
+  const [selectedSeries, setSelectedSeries] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Filter trades by selected series
+  const filteredData = useMemo(() => {
+    if (!processedData || !selectedSeries) {
+      return processedData;
+    }
+
+    const filteredTrades = filterTradesBySeries(processedData.trades, selectedSeries);
+    
+    // Filter matchedTrades based on ticker series
+    const filteredMatchedTrades = processedData.matchedTrades.filter(trade => {
+      const parts = trade.Ticker.split('-');
+      return parts[0] === selectedSeries;
+    });
+
+    // Calculate stats from matchedTrades (works for both CSV formats)
+    const yesNoBreakdown = filteredMatchedTrades.reduce((acc, trade) => {
+      acc[trade.Entry_Direction] = (acc[trade.Entry_Direction] || 0) + trade.Contracts;
+      return acc;
+    }, {} as Record<string, number>);
+
+    const totalFees = filteredMatchedTrades.reduce((sum, t) => sum + t.Total_Fees, 0);
+    const totalProfit = filteredMatchedTrades.reduce((sum, t) => sum + t.Net_Profit, 0);
+
+    // Calculate average prices from matchedTrades
+    let totalWeightedEntryPrice = 0;
+    let totalWeightedExitPrice = 0;
+    let totalContracts = 0;
+
+    filteredMatchedTrades.forEach(trade => {
+      totalWeightedEntryPrice += trade.Entry_Price * trade.Contracts;
+      totalWeightedExitPrice += trade.Exit_Price * trade.Contracts;
+      totalContracts += trade.Contracts;
+    });
+
+    const avgContractPurchasePrice = totalContracts > 0 ? totalWeightedEntryPrice / totalContracts : 0;
+    const avgContractFinalPrice = totalContracts > 0 ? totalWeightedExitPrice / totalContracts : 0;
+
+    // Calculate holding period
+    const totalTradeValue = filteredMatchedTrades.reduce((sum, trade) => sum + trade.Entry_Cost, 0);
+    const weightedHoldingPeriod = totalTradeValue > 0 
+      ? filteredMatchedTrades.reduce((sum, trade) => {
+          const weight = trade.Entry_Cost / totalTradeValue;
+          return sum + (trade.Holding_Period_Days * weight);
+        }, 0)
+      : 0;
+
+    // Win rates from matchedTrades
+    const profitableTrades = filteredMatchedTrades.filter(t => t.Net_Profit > 0);
+    const settledTrades = filteredMatchedTrades.filter(t => t.Exit_Type === 'settlement');
+    const profitableSettledTrades = settledTrades.filter(t => t.Net_Profit > 0);
+
+    const winRate = filteredMatchedTrades.length > 0 ? profitableTrades.length / filteredMatchedTrades.length : 0;
+    const settledWinRate = settledTrades.length > 0 ? profitableSettledTrades.length / settledTrades.length : 0;
+
+    return {
+      originalData: processedData.originalData,
+      trades: filteredTrades,
+      matchedTrades: filteredMatchedTrades,
+      basicStats: {
+        uniqueTickers: new Set(filteredMatchedTrades.map(t => t.Ticker)).size,
+        totalTrades: filteredMatchedTrades.length,
+        yesNoBreakdown: { 
+          Yes: yesNoBreakdown["Yes"] || 0, 
+          No: yesNoBreakdown["No"] || 0 
+        },
+        totalFees,
+        totalProfit,
+        avgContractPurchasePrice,
+        avgContractFinalPrice,
+        weightedHoldingPeriod,
+        winRate,
+        settledWinRate,
+      },
+    };
+  }, [processedData, selectedSeries]);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -85,6 +164,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     setProcessedData(null);
     setError('');
     setUploadedFiles([]);
+    setSelectedSeries(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -178,44 +258,59 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         </div>
       )}
 
-      {processedData && !loading && (
+      {filteredData && !loading && (
         <div>
           <div className="mb-6">
-            <h2 className="text-xl font-semibold mb-4 text-center">Profit & Loss Over Time</h2>
-            <PnlChart trades={processedData.trades} />
+            <h2 className="text-xl font-semibold mb-4 text-center">
+              Profit & Loss Over Time
+              {selectedSeries && <span className="text-blue-600 text-base ml-2">({selectedSeries})</span>}
+            </h2>
+            <PnlChart trades={filteredData.trades} />
           </div>
           
           <Overview 
-            stats={processedData.basicStats} 
-            trades={processedData.trades}
+            stats={filteredData.basicStats} 
+            matchedTrades={filteredData.matchedTrades}
           />
           
           <RiskAdjustedReturns 
-            matchedTrades={processedData.matchedTrades}
+            matchedTrades={filteredData.matchedTrades}
+          />
+          
+          <SeriesStatsTable 
+            matchedTrades={processedData!.matchedTrades}
+            selectedSeries={selectedSeries}
+            onSeriesSelect={setSelectedSeries}
           />
           
           <div className="mt-6">
             <h2 className="text-xl font-semibold mb-4 text-center">Trading Distributions</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               <div className="bg-white shadow rounded-lg p-6">
                 <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Trade Direction</h3>
                 <div className="h-[300px] w-full">
                   <TradeDirectionPie 
-                    yesCount={processedData.basicStats.yesNoBreakdown.Yes} 
-                    noCount={processedData.basicStats.yesNoBreakdown.No} 
+                    yesCount={filteredData.basicStats.yesNoBreakdown.Yes} 
+                    noCount={filteredData.basicStats.yesNoBreakdown.No} 
                   />
                 </div>
               </div>
               <div className="bg-white shadow rounded-lg p-6">
                 <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Settlement vs Exit</h3>
                 <div className="h-[300px] w-full">
-                  <TradeSettlementPie trades={processedData.trades} />
+                  <TradeSettlementPie matchedTrades={filteredData.matchedTrades} />
+                </div>
+              </div>
+              <div className="bg-white shadow rounded-lg p-6">
+                <h3 className="text-lg font-medium text-gray-700 mb-4 text-center">Maker vs Taker</h3>
+                <div className="h-[300px] w-full">
+                  <MakerTakerPie matchedTrades={filteredData.matchedTrades} />
                 </div>
               </div>
             </div>
           </div>
           
-          <TradeList trades={processedData.matchedTrades} />
+          <TradeList trades={filteredData.matchedTrades} />
         </div>
       )}
 

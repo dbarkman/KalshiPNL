@@ -1,6 +1,28 @@
 import { parse } from 'papaparse';
 import { toDate } from 'date-fns-tz';
 
+// ============ CSV FORMAT DETECTION ============
+
+export type CsvFormat = 'legacy' | 'new';
+
+// New format columns (2025+)
+const NEW_FORMAT_COLUMNS = ['type', 'quantity', 'market_ticker', 'side', 'entry_price_cents', 'exit_price_cents', 'open_fees_cents', 'close_fees_cents', 'realized_pnl_without_fees_cents', 'realized_pnl_with_fees_cents', 'close_timestamp', 'open_timestamp'];
+
+// Legacy format columns
+const LEGACY_FORMAT_COLUMNS = ['Ticker', 'Type', 'Direction', 'Contracts', 'Average_Price', 'Created'];
+
+export const detectCsvFormat = (headers: string[]): CsvFormat => {
+  const hasNewFormat = NEW_FORMAT_COLUMNS.every(col => headers.includes(col));
+  if (hasNewFormat) return 'new';
+  
+  const hasLegacyFormat = LEGACY_FORMAT_COLUMNS.every(col => headers.includes(col));
+  if (hasLegacyFormat) return 'legacy';
+  
+  throw new Error(`Unrecognized CSV format. Expected columns for either new format (${NEW_FORMAT_COLUMNS.slice(0, 3).join(', ')}...) or legacy format (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
+};
+
+// ============ INTERFACES ============
+
 export interface Trade {
   Ticker: string;
   Type: string;
@@ -63,6 +85,135 @@ export interface ProcessedData {
     settledWinRate: number;
   };
 }
+
+// Parse ticker into components: {SERIES}-{EVENT}-{MARKET}
+// Example: KXKIRKMENTION-25DEC04-PATR -> { series: 'KXKIRKMENTION', event: '25DEC04', market: 'PATR' }
+export interface TickerComponents {
+  series: string;
+  event: string;
+  market: string;
+}
+
+// Series-level statistics
+export interface SeriesStats {
+  series: string;
+  pnl: number;
+  eventsTraded: Set<string>;
+  marketsTraded: Set<string>;
+  totalCost: number;
+  tradesCount: number;
+  winCount: number;
+}
+
+// ============ TICKER/SERIES UTILITIES ============
+
+export const parseTickerComponents = (ticker: string): TickerComponents => {
+  const parts = ticker.split('-');
+  if (parts.length >= 3) {
+    // Standard format: SERIES-EVENT-MARKET
+    return {
+      series: parts[0],
+      event: parts[1],
+      market: parts.slice(2).join('-'), // Market might have dashes
+    };
+  } else if (parts.length === 2) {
+    // Some tickers might be SERIES-MARKET with no event
+    return {
+      series: parts[0],
+      event: '',
+      market: parts[1],
+    };
+  }
+  // Fallback for non-standard tickers
+  return {
+    series: ticker,
+    event: '',
+    market: '',
+  };
+};
+
+// Calculate series stats from MatchedTrades (works for both CSV formats)
+export const calculateSeriesStatsFromMatched = (matchedTrades: MatchedTrade[]): Map<string, SeriesStats> => {
+  const seriesMap = new Map<string, SeriesStats>();
+
+  matchedTrades.forEach(trade => {
+    const { series, event, market } = parseTickerComponents(trade.Ticker);
+    
+    if (!seriesMap.has(series)) {
+      seriesMap.set(series, {
+        series,
+        pnl: 0,
+        eventsTraded: new Set(),
+        marketsTraded: new Set(),
+        totalCost: 0,
+        tradesCount: 0,
+        winCount: 0,
+      });
+    }
+    
+    const stats = seriesMap.get(series)!;
+    stats.pnl += trade.Net_Profit;
+    if (event) stats.eventsTraded.add(event);
+    if (market) stats.marketsTraded.add(market);
+    stats.totalCost += trade.Entry_Cost;
+    stats.tradesCount++;
+    if (trade.Net_Profit > 0) {
+      stats.winCount++;
+    }
+  });
+
+  return seriesMap;
+};
+
+// Legacy function for backward compatibility (uses Trade[])
+export const calculateSeriesStats = (trades: Trade[]): Map<string, SeriesStats> => {
+  const seriesMap = new Map<string, SeriesStats>();
+
+  trades.forEach(trade => {
+    const { series, event, market } = parseTickerComponents(trade.Ticker);
+    
+    if (!seriesMap.has(series)) {
+      seriesMap.set(series, {
+        series,
+        pnl: 0,
+        eventsTraded: new Set(),
+        marketsTraded: new Set(),
+        totalCost: 0,
+        tradesCount: 0,
+        winCount: 0,
+      });
+    }
+    
+    const stats = seriesMap.get(series)!;
+    stats.pnl += trade.Realized_Profit;
+    if (event) stats.eventsTraded.add(event);
+    if (market) stats.marketsTraded.add(market);
+    
+    // Track cost and trades for exit trades (to calculate average return)
+    if (trade.Type === 'settlement' || trade.Realized_Revenue > 0) {
+      if (trade.Type === 'settlement') {
+        stats.totalCost += Math.abs(trade.Realized_Cost);
+      } else {
+        stats.totalCost += Math.abs(trade.Realized_Cost) - (trade.Average_Price * trade.Realized_Revenue / 100);
+      }
+      stats.tradesCount++;
+      if (trade.Realized_Profit > 0) {
+        stats.winCount++;
+      }
+    }
+  });
+
+  return seriesMap;
+};
+
+export const filterTradesBySeries = (trades: Trade[], series: string): Trade[] => {
+  return trades.filter(trade => {
+    const { series: tradeSeries } = parseTickerComponents(trade.Ticker);
+    return tradeSeries === series;
+  });
+};
+
+// ============ DATE PARSING ============
 
 // Parse date by converting Kalshi format to standard format for date-fns-tz
 const parseDate = (dateStr: string): Date => {
@@ -384,7 +535,225 @@ const calculateBasicStats = (trades: Trade[], matchedTrades: MatchedTrade[]) => 
   };
 };
 
-// Main processing function
+// ============ NEW FORMAT PARSER (2025+) ============
+
+interface NewFormatRow {
+  type: string;
+  quantity: string;
+  market_ticker: string;
+  side: string;
+  entry_price_cents: string;
+  exit_price_cents: string;
+  open_fees_cents: string;
+  close_fees_cents: string;
+  realized_pnl_without_fees_cents: string;
+  realized_pnl_with_fees_cents: string;
+  close_timestamp: string;
+  open_timestamp: string;
+}
+
+const processNewFormat = (rawData: NewFormatRow[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
+  const trades: Trade[] = [];
+  const matchedTrades: MatchedTrade[] = [];
+  let skippedRows = 0;
+  
+  rawData.forEach((row, index) => {
+    try {
+      if (!row.market_ticker || row.type !== 'trade') return;
+      
+      // Skip rows with missing timestamps
+      if (!row.open_timestamp || !row.close_timestamp) {
+        skippedRows++;
+        return;
+      }
+      
+      const quantity = parseInt(row.quantity) || 0;
+      if (quantity === 0) return; // Skip zero quantity trades
+      
+      const entryPrice = parseInt(row.entry_price_cents) || 0;
+      const exitPrice = parseInt(row.exit_price_cents) || 0;
+      const openFees = (parseInt(row.open_fees_cents) || 0) / 100; // Convert to dollars
+      const closeFees = (parseInt(row.close_fees_cents) || 0) / 100;
+      const pnlWithFees = (parseInt(row.realized_pnl_with_fees_cents) || 0) / 100;
+      const pnlWithoutFees = (parseInt(row.realized_pnl_without_fees_cents) || 0) / 100;
+      const totalFees = openFees + closeFees;
+      
+      const entryDate = new Date(row.open_timestamp);
+      const exitDate = new Date(row.close_timestamp);
+      
+      // Validate dates
+      if (isNaN(entryDate.getTime()) || isNaN(exitDate.getTime())) {
+        skippedRows++;
+        console.warn(`Skipping row ${index}: Invalid date - open: "${row.open_timestamp}", close: "${row.close_timestamp}"`);
+        return;
+      }
+      
+      // Validate and normalize direction
+      const side = row.side?.toLowerCase();
+      if (side !== 'yes' && side !== 'no') {
+        skippedRows++;
+        return;
+      }
+      const direction = side === 'yes' ? 'Yes' : 'No';
+      
+      // Determine exit type based on exit price (0 or 100 = settlement, otherwise trade)
+      const exitType = (exitPrice === 0 || exitPrice === 100) ? 'settlement' : 'trade';
+      
+      // Create a Trade object for compatibility with existing stats calculations
+      // This represents a "virtual" exit trade in the legacy format
+      const entryCost = (quantity * entryPrice) / 100; // Convert cents to dollars
+      const trade: Trade = {
+        Ticker: row.market_ticker,
+        Type: exitType,
+        Direction: direction,
+        Contracts: quantity,
+        Average_Price: entryPrice, // Entry price in cents
+        Realized_Revenue: exitType === 'settlement' ? (exitPrice === 100 ? quantity : 0) : quantity,
+        Realized_Cost: entryCost,
+        Realized_Profit: pnlWithFees,
+        Fees: totalFees,
+        Created: row.close_timestamp,
+        Date: exitDate,
+        Trade_Cost: entryCost,
+      };
+      trades.push(trade);
+      
+      // Create MatchedTrade directly (no FIFO matching needed)
+      const holdingDays = (exitDate.getTime() - entryDate.getTime()) / (24 * 3600 * 1000);
+      const matchedTrade: MatchedTrade = {
+        Ticker: row.market_ticker,
+        Entry_Date: entryDate,
+        Exit_Date: exitDate,
+        Entry_Direction: direction,
+        Exit_Type: exitType,
+        Contracts: quantity,
+        Entry_Cost: entryCost,
+        Realized_Profit: pnlWithoutFees,
+        Net_Profit: pnlWithFees,
+        Holding_Period_Days: holdingDays,
+        ROI: entryCost > 0 ? pnlWithFees / entryCost : 0,
+        Entry_Fee: openFees,
+        Exit_Fee: closeFees,
+        Total_Fees: totalFees,
+        Entry_Price: entryPrice,
+        Exit_Price: exitPrice,
+      };
+      matchedTrades.push(matchedTrade);
+      
+    } catch (error) {
+      console.error("Error processing new format row:", row, error);
+      skippedRows++;
+    }
+  });
+  
+  console.log(`New format processing: ${matchedTrades.length} trades processed, ${skippedRows} rows skipped`);
+  
+  return { trades, matchedTrades };
+};
+
+// Calculate stats from new format (uses matchedTrades as source of truth)
+const calculateBasicStatsFromMatchedTrades = (matchedTrades: MatchedTrade[]): ProcessedData['basicStats'] => {
+  const uniqueTickers = new Set(matchedTrades.map(t => t.Ticker)).size;
+  
+  // Yes/No breakdown by contracts
+  const yesNoBreakdown = matchedTrades.reduce((acc, trade) => {
+    acc[trade.Entry_Direction] = (acc[trade.Entry_Direction] || 0) + trade.Contracts;
+    return acc;
+  }, {} as Record<string, number>);
+  
+  const totalFees = matchedTrades.reduce((sum, t) => sum + t.Total_Fees, 0);
+  const totalProfit = matchedTrades.reduce((sum, t) => sum + t.Net_Profit, 0);
+  
+  // Average entry/exit prices weighted by contracts
+  let totalWeightedEntryPrice = 0;
+  let totalWeightedExitPrice = 0;
+  let totalContracts = 0;
+  
+  matchedTrades.forEach(trade => {
+    totalWeightedEntryPrice += trade.Entry_Price * trade.Contracts;
+    totalWeightedExitPrice += trade.Exit_Price * trade.Contracts;
+    totalContracts += trade.Contracts;
+  });
+  
+  const avgContractPurchasePrice = totalContracts > 0 ? totalWeightedEntryPrice / totalContracts : 0;
+  const avgContractFinalPrice = totalContracts > 0 ? totalWeightedExitPrice / totalContracts : 0;
+  
+  // Weighted holding period
+  const totalTradeValue = matchedTrades.reduce((sum, t) => sum + t.Entry_Cost, 0);
+  const weightedHoldingPeriod = totalTradeValue > 0 
+    ? matchedTrades.reduce((sum, t) => sum + (t.Holding_Period_Days * t.Entry_Cost / totalTradeValue), 0)
+    : 0;
+  
+  // Win rates
+  const profitableTrades = matchedTrades.filter(t => t.Net_Profit > 0);
+  const settledTrades = matchedTrades.filter(t => t.Exit_Type === 'settlement');
+  const profitableSettledTrades = settledTrades.filter(t => t.Net_Profit > 0);
+  
+  const winRate = matchedTrades.length > 0 ? profitableTrades.length / matchedTrades.length : 0;
+  const settledWinRate = settledTrades.length > 0 ? profitableSettledTrades.length / settledTrades.length : 0;
+  
+  return {
+    uniqueTickers,
+    totalTrades: matchedTrades.length,
+    yesNoBreakdown: { 
+      Yes: yesNoBreakdown["Yes"] || 0, 
+      No: yesNoBreakdown["No"] || 0 
+    },
+    totalFees,
+    totalProfit,
+    avgContractPurchasePrice,
+    avgContractFinalPrice,
+    weightedHoldingPeriod,
+    winRate,
+    settledWinRate,
+  };
+};
+
+// ============ LEGACY FORMAT PARSER ============
+
+const processLegacyFormat = (rawData: any[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
+  // Filter out credit transactions and convert string values and create Date objects
+  const trades: Trade[] = rawData
+    .filter(row => row && row.Ticker && row.Type !== 'credit')
+    .map(row => {
+      try {
+        // Clean up monetary columns
+        const cleanMoney = (val: string) => {
+          if (!val) return 0;
+          return parseFloat(val.replace('$', '').replace('+', '').trim()) || 0;
+        };
+        
+        const trade: Trade = {
+          Ticker: row.Ticker,
+          Type: row.Type,
+          Direction: row.Direction,
+          Contracts: parseFloat(row.Contracts) || 0,
+          Average_Price: parseFloat(row.Average_Price) || 0,
+          Realized_Revenue: cleanMoney(row.Realized_Revenue),
+          Realized_Cost: cleanMoney(row.Realized_Cost),
+          Realized_Profit: cleanMoney(row.Realized_Profit),
+          Fees: row.Fees ? cleanMoney(row.Fees) : 0,
+          Created: row.Created,
+          Date: parseDate(row.Created),
+          Trade_Cost: 0 // Will be calculated later
+        };
+        
+        return trade;
+      } catch (error) {
+        console.error("Error processing legacy row:", row, error);
+        return null;
+      }
+    }).filter(Boolean) as Trade[];
+  
+  // Match trades using FIFO
+  const matchedTrades = matchTradesFifo(trades);
+  
+  return { trades, matchedTrades };
+};
+
+// ============ MAIN PROCESSING FUNCTION ============
+
+// Main processing function - auto-detects format
 export const processCSVData = (results: any): ProcessedData => {
   try {
     // Validate CSV structure
@@ -392,59 +761,31 @@ export const processCSVData = (results: any): ProcessedData => {
       throw new Error("Invalid CSV format: No data found");
     }
     
-    // Check for required columns
-    const requiredColumns = ['Ticker', 'Type', 'Direction', 'Contracts', 'Average_Price', 'Created'];
     const headers = results.meta.fields || [];
-    const missingColumns = requiredColumns.filter(col => !headers.includes(col));
-    
-    if (missingColumns.length > 0) {
-      throw new Error(`Invalid CSV format: Missing required columns: ${missingColumns.join(', ')}`);
-    }
-    
+    const format = detectCsvFormat(headers);
     const rawData = results.data as any[];
     
-    // Filter out credit transactions and convert string values and create Date objects
-    const trades: Trade[] = rawData
-      .filter(row => row && row.Ticker && row.Type !== 'credit')
-      .map(row => {
-        try {
-          // Clean up monetary columns
-          const cleanMoney = (val: string) => {
-            if (!val) return 0;
-            return parseFloat(val.replace('$', '').trim()) || 0;
-          };
-          
-          const trade: Trade = {
-            Ticker: row.Ticker,
-            Type: row.Type,
-            Direction: row.Direction,
-            Contracts: parseFloat(row.Contracts) || 0,
-            Average_Price: parseFloat(row.Average_Price) || 0,
-            Realized_Revenue: cleanMoney(row.Realized_Revenue),
-            Realized_Cost: cleanMoney(row.Realized_Cost),
-            Realized_Profit: cleanMoney(row.Realized_Profit),
-            Fees: row.Fees ? cleanMoney(row.Fees) : 0,
-            Created: row.Created,
-            Date: parseDate(row.Created),
-            Trade_Cost: 0 // Will be calculated later
-          };
-          
-          return trade;
-        } catch (error) {
-          console.error("Error processing row:", row, error);
-          return null;
-        }
-      }).filter(Boolean) as Trade[];
+    console.log(`Detected CSV format: ${format}`);
     
-    if (trades.length === 0) {
-      throw new Error("No valid trades found in the CSV file");
+    let trades: Trade[];
+    let matchedTrades: MatchedTrade[];
+    let basicStats: ProcessedData['basicStats'];
+    
+    if (format === 'new') {
+      const processed = processNewFormat(rawData);
+      trades = processed.trades;
+      matchedTrades = processed.matchedTrades;
+      basicStats = calculateBasicStatsFromMatchedTrades(matchedTrades);
+    } else {
+      const processed = processLegacyFormat(rawData);
+      trades = processed.trades;
+      matchedTrades = processed.matchedTrades;
+      basicStats = calculateBasicStats(trades, matchedTrades);
     }
     
-    // Match trades using FIFO
-    const matchedTrades = matchTradesFifo(trades);
-    
-    // Calculate basic statistics
-    const basicStats = calculateBasicStats(trades, matchedTrades);
+    if (trades.length === 0 && matchedTrades.length === 0) {
+      throw new Error("No valid trades found in the CSV file");
+    }
     
     return {
       originalData: rawData,
@@ -460,17 +801,16 @@ export const processCSVData = (results: any): ProcessedData => {
 
 // Combine multiple ProcessedData objects into one
 export const combineProcessedData = (dataArray: ProcessedData[]): ProcessedData => {
-  // Combine all trades
+  // Combine all trades and matched trades
   const allTrades = dataArray.reduce<Trade[]>((acc, data) => [...acc, ...data.trades], []);
+  const allMatchedTrades = dataArray.reduce<MatchedTrade[]>((acc, data) => [...acc, ...data.matchedTrades], []);
   
-  // Sort all trades by date
+  // Sort trades by date
   const sortedTrades = allTrades.sort((a, b) => a.Date.getTime() - b.Date.getTime());
+  const sortedMatchedTrades = allMatchedTrades.sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime());
   
-  // Match trades using FIFO across all data
-  const matchedTrades = matchTradesFifo(sortedTrades);
-  
-  // Calculate combined stats
-  const basicStats = calculateBasicStats(sortedTrades, matchedTrades);
+  // Use matchedTrades-based stats since it works for both formats
+  const basicStats = calculateBasicStatsFromMatchedTrades(sortedMatchedTrades);
   
   // Combine original data
   const originalData = dataArray.reduce<any[]>((acc, data) => [...acc, ...data.originalData], []);
@@ -478,7 +818,7 @@ export const combineProcessedData = (dataArray: ProcessedData[]): ProcessedData 
   return {
     originalData,
     trades: sortedTrades,
-    matchedTrades,
+    matchedTrades: sortedMatchedTrades,
     basicStats,
   };
 }; 
