@@ -2,7 +2,7 @@
 
 import { useState, useRef, useMemo } from 'react';
 import Papa from 'papaparse';
-import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade } from '@/utils/processData';
+import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesCategoryMap, parseTickerComponents } from '@/utils/processData';
 import Overview from '@/components/Overview';
 import PnlChart from './PnlChart';
 import TradeDirectionPie from './TradeDirectionPie';
@@ -11,6 +11,8 @@ import MakerTakerPie from './MakerTakerPie';
 import RiskAdjustedReturns from './RiskAdjustedReturns';
 import TradeList from './TradeList';
 import SeriesStatsTable from './SeriesStatsTable';
+import CategoryStatsTable from './CategoryStatsTable';
+import TradeNarrative from './TradeNarrative';
 
 interface CsvData {
   headers: string[];
@@ -28,20 +30,56 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
   const [loading, setLoading] = useState<boolean>(false);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [selectedSeries, setSelectedSeries] = useState<string | null>(null);
+  const [categoryMap, setCategoryMap] = useState<Map<string, string>>(new Map());
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [seriesFilter, setSeriesFilter] = useState<string>('');
+  const categoryMapFetched = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Filter trades by selected series
+  const seriesFilterUpper = seriesFilter.toUpperCase();
+
+  // Filter trades by selected category, series name filter, and/or selected series
   const filteredData = useMemo(() => {
-    if (!processedData || !selectedSeries) {
+    if (!processedData || (!selectedSeries && !selectedCategory && !seriesFilterUpper)) {
       return processedData;
     }
 
-    const filteredTrades = filterTradesBySeries(processedData.trades, selectedSeries);
-    
-    // Filter matchedTrades based on ticker series
-    const filteredMatchedTrades = processedData.matchedTrades.filter(trade => {
-      const parts = trade.Ticker.split('-');
-      return parts[0] === selectedSeries;
+    let filteredMatchedTrades = processedData.matchedTrades;
+
+    // Filter by category first
+    if (selectedCategory && categoryMap.size > 0) {
+      filteredMatchedTrades = filteredMatchedTrades.filter(trade => {
+        const { series } = parseTickerComponents(trade.Ticker);
+        const cat = categoryMap.get(series) || 'Uncategorized';
+        return cat === selectedCategory;
+      });
+    }
+
+    // Filter by series name substring
+    if (seriesFilterUpper) {
+      filteredMatchedTrades = filteredMatchedTrades.filter(trade => {
+        const { series } = parseTickerComponents(trade.Ticker);
+        return series.toUpperCase().includes(seriesFilterUpper);
+      });
+    }
+
+    // Then filter by selected series
+    if (selectedSeries) {
+      filteredMatchedTrades = filteredMatchedTrades.filter(trade => {
+        const parts = trade.Ticker.split('-');
+        return parts[0] === selectedSeries;
+      });
+    }
+
+    const filteredTrades = processedData.trades.filter(trade => {
+      const { series } = parseTickerComponents(trade.Ticker);
+      if (selectedCategory && categoryMap.size > 0) {
+        const cat = categoryMap.get(series) || 'Uncategorized';
+        if (cat !== selectedCategory) return false;
+      }
+      if (seriesFilterUpper && !series.toUpperCase().includes(seriesFilterUpper)) return false;
+      if (selectedSeries && series !== selectedSeries) return false;
+      return true;
     });
 
     // Calculate stats from matchedTrades (works for both CSV formats)
@@ -104,7 +142,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         settledWinRate,
       },
     };
-  }, [processedData, selectedSeries]);
+  }, [processedData, selectedSeries, selectedCategory, categoryMap, seriesFilterUpper]);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -114,6 +152,14 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     setError('');
 
     try {
+      // Fetch category map once
+      if (!categoryMapFetched.current) {
+        categoryMapFetched.current = true;
+        fetchSeriesCategoryMap()
+          .then(map => setCategoryMap(map))
+          .catch(err => console.error('Failed to fetch category map:', err));
+      }
+
       const processedDataArray: ProcessedData[] = [];
 
       // Process each file
@@ -165,6 +211,8 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     setError('');
     setUploadedFiles([]);
     setSelectedSeries(null);
+    setSelectedCategory(null);
+    setSeriesFilter('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -263,24 +311,62 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
           <div className="mb-6">
             <h2 className="text-xl font-semibold mb-4 text-center">
               Profit & Loss Over Time
+              {selectedCategory && <span className="text-purple-600 text-base ml-2">({selectedCategory})</span>}
+              {seriesFilter && <span className="text-orange-600 text-base ml-2">(~{seriesFilter})</span>}
               {selectedSeries && <span className="text-blue-600 text-base ml-2">({selectedSeries})</span>}
             </h2>
             <PnlChart trades={filteredData.trades} />
           </div>
           
-          <Overview 
-            stats={filteredData.basicStats} 
+          <Overview
+            stats={filteredData.basicStats}
             matchedTrades={filteredData.matchedTrades}
           />
-          
-          <RiskAdjustedReturns 
+
+          <RiskAdjustedReturns
             matchedTrades={filteredData.matchedTrades}
           />
-          
-          <SeriesStatsTable 
+
+          <TradeNarrative
             matchedTrades={processedData!.matchedTrades}
+            basicStats={processedData!.basicStats}
+            categoryMap={categoryMap}
+          />
+
+          {categoryMap.size > 0 && (
+            <CategoryStatsTable
+              matchedTrades={processedData!.matchedTrades}
+              categoryMap={categoryMap}
+              selectedCategory={selectedCategory}
+              onCategorySelect={(cat) => {
+                if (cat === null) {
+                  // Clearing category also clears series
+                  setSelectedCategory(null);
+                  setSelectedSeries(null);
+                } else {
+                  setSelectedCategory(cat);
+                  setSelectedSeries(null);
+                }
+              }}
+            />
+          )}
+
+          <SeriesStatsTable
+            matchedTrades={processedData!.matchedTrades.filter(t => {
+              const { series } = parseTickerComponents(t.Ticker);
+              if (selectedCategory && categoryMap.size > 0) {
+                if ((categoryMap.get(series) || 'Uncategorized') !== selectedCategory) return false;
+              }
+              if (seriesFilterUpper && !series.toUpperCase().includes(seriesFilterUpper)) return false;
+              return true;
+            })}
             selectedSeries={selectedSeries}
             onSeriesSelect={setSelectedSeries}
+            seriesFilter={seriesFilter}
+            onSeriesFilterChange={(val) => {
+              setSeriesFilter(val);
+              setSelectedSeries(null);
+            }}
           />
           
           <div className="mt-6">
@@ -310,7 +396,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             </div>
           </div>
           
-          <TradeList trades={filteredData.matchedTrades} />
+          {(selectedSeries || selectedCategory || seriesFilter) && <TradeList trades={filteredData.matchedTrades} />}
         </div>
       )}
 

@@ -105,6 +105,72 @@ export interface SeriesStats {
   winCount: number;
 }
 
+// Category-level statistics
+export interface CategoryStats {
+  category: string;
+  pnl: number;
+  seriesTraded: Set<string>;
+  eventsTraded: Set<string>;
+  marketsTraded: Set<string>;
+  totalCost: number;
+  tradesCount: number;
+  winCount: number;
+}
+
+// Fetch series → category mapping from Kalshi public API
+export const fetchSeriesCategoryMap = async (): Promise<Map<string, string>> => {
+  const resp = await fetch('https://api.elections.kalshi.com/trade-api/v2/series');
+  if (!resp.ok) {
+    console.error('Failed to fetch series data:', resp.status);
+    return new Map();
+  }
+  const data = await resp.json();
+  const map = new Map<string, string>();
+  for (const s of data.series || []) {
+    map.set(s.ticker, s.category || 'Uncategorized');
+  }
+  return map;
+};
+
+// Calculate category stats from matched trades using a series→category map
+export const calculateCategoryStatsFromMatched = (
+  matchedTrades: MatchedTrade[],
+  categoryMap: Map<string, string>,
+): Map<string, CategoryStats> => {
+  const catMap = new Map<string, CategoryStats>();
+
+  matchedTrades.forEach(trade => {
+    const { series, event, market } = parseTickerComponents(trade.Ticker);
+    const category = categoryMap.get(series) || 'Uncategorized';
+
+    if (!catMap.has(category)) {
+      catMap.set(category, {
+        category,
+        pnl: 0,
+        seriesTraded: new Set(),
+        eventsTraded: new Set(),
+        marketsTraded: new Set(),
+        totalCost: 0,
+        tradesCount: 0,
+        winCount: 0,
+      });
+    }
+
+    const stats = catMap.get(category)!;
+    stats.pnl += trade.Net_Profit;
+    stats.seriesTraded.add(series);
+    if (event) stats.eventsTraded.add(event);
+    if (market) stats.marketsTraded.add(market);
+    stats.totalCost += trade.Entry_Cost;
+    stats.tradesCount++;
+    if (trade.Net_Profit > 0) {
+      stats.winCount++;
+    }
+  });
+
+  return catMap;
+};
+
 // ============ TICKER/SERIES UTILITIES ============
 
 export const parseTickerComponents = (ticker: string): TickerComponents => {
