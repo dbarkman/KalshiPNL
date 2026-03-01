@@ -13,6 +13,7 @@ import TradeList from './TradeList';
 import SeriesStatsTable from './SeriesStatsTable';
 import CategoryStatsTable from './CategoryStatsTable';
 import TradeNarrative from './TradeNarrative';
+import DailyPnlTable from './DailyPnlTable';
 
 interface CsvData {
   headers: string[];
@@ -332,6 +333,8 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             basicStats={processedData!.basicStats}
             categoryMap={categoryMap}
           />
+
+          <DailyPnlTable matchedTrades={filteredData.matchedTrades} />
 
           {categoryMap.size > 0 && (
             <CategoryStatsTable
