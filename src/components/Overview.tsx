@@ -76,6 +76,17 @@ export default function Overview({ stats, matchedTrades }: OverviewProps) {
     ? entries.reduce(([t, p], [t2, p2]) => (p2 < p ? [t2, p2] : [t, p]))
     : ['N/A', 0];
 
+  // Calculate Kelly Criterion: Kelly % = W - (1 - W) / R
+  // W = win rate, R = avg win / avg loss
+  const winners = matchedTrades.filter(t => t.Net_Profit > 0);
+  const losers = matchedTrades.filter(t => t.Net_Profit <= 0);
+  const avgWin = winners.length > 0 ? winners.reduce((s, t) => s + t.Net_Profit, 0) / winners.length : 0;
+  const avgLoss = losers.length > 0 ? Math.abs(losers.reduce((s, t) => s + t.Net_Profit, 0) / losers.length) : 0;
+  const winRate = matchedTrades.length > 0 ? winners.length / matchedTrades.length : 0;
+  const winLossRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
+  const kellyPct = winLossRatio > 0 ? winRate - (1 - winRate) / winLossRatio : 0;
+  const kellyPosition = kellyPct * stats.totalProfit;  // dollars
+
   // Find highest ROI trade
   const [highestROITrade, highestROI] = matchedTrades.reduce<[MatchedTrade | null, number]>((best, trade) => {
     // Skip trades with zero or negative investment
@@ -154,16 +165,22 @@ export default function Overview({ stats, matchedTrades }: OverviewProps) {
         {/* Entries and Exits */}
         <div>
           <h3 className="text-lg font-medium text-gray-700 mb-3">Entries and Exits</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 gap-4">
-            <StatCard 
-              title="Avg Entry Price" 
-              value={formatCents(stats.avgContractPurchasePrice)} 
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <StatCard
+              title="Avg Entry Price"
+              value={formatCents(stats.avgContractPurchasePrice)}
               tooltip="Average price paid per contract when entering positions"
             />
-            <StatCard 
-              title="Avg Exit Price" 
-              value={formatCents(stats.avgContractFinalPrice)} 
-              tooltip="Average price received per contract when positioned are sold or settled"
+            <StatCard
+              title="Avg Exit Price"
+              value={formatCents(stats.avgContractFinalPrice)}
+              tooltip="Average price received per contract when positions are sold or settled"
+            />
+            <StatCard
+              title="Optimal Position"
+              value={`${formatCurrency(kellyPosition)} (½K: ${formatCurrency(kellyPosition / 2)})`}
+              tooltip={`Kelly Criterion (${formatPercent(kellyPct)}) applied to ${formatCurrency(stats.totalProfit)} total profit as bankroll. W=${formatPercent(winRate)}, R=${winLossRatio.toFixed(2)} (avg win ${formatCurrency(avgWin)} / avg loss ${formatCurrency(avgLoss)}). Half-Kelly reduces volatility.`}
+              className="border-l-4 border-yellow-500"
             />
           </div>
         </div>

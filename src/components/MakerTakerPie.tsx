@@ -21,8 +21,12 @@ export default function MakerTakerPie({ matchedTrades }: MakerTakerPieProps) {
     .filter(t => t.Entry_Fee > 0)
     .reduce((sum, t) => sum + t.Contracts, 0);
 
+  const total = makerContracts + takerContracts;
+  const makerPct = total > 0 ? ((makerContracts / total) * 100).toFixed(1) : '0';
+  const takerPct = total > 0 ? ((takerContracts / total) * 100).toFixed(1) : '0';
+
   const data = {
-    labels: ['Maker (0 fees)', 'Taker (paid fees)'],
+    labels: [`Maker: ${makerContracts.toLocaleString()} (${makerPct}%)`, `Taker: ${takerContracts.toLocaleString()} (${takerPct}%)`],
     datasets: [
       {
         label: 'Contracts',

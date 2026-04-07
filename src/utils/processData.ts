@@ -101,6 +101,7 @@ export interface SeriesStats {
   eventsTraded: Set<string>;
   marketsTraded: Set<string>;
   totalCost: number;
+  totalFees: number;
   tradesCount: number;
   winCount: number;
 }
@@ -113,23 +114,108 @@ export interface CategoryStats {
   eventsTraded: Set<string>;
   marketsTraded: Set<string>;
   totalCost: number;
+  totalFees: number;
   tradesCount: number;
   winCount: number;
 }
 
+// ============ SETTLEMENT FETCHING ============
+
+export type SettlementResult = 'yes' | 'no' | null; // null = still open/pending
+
+const CACHE_PREFIX = 'ksettlement:';
+
+const getCached = (ticker: string): SettlementResult => {
+  try {
+    const val = localStorage.getItem(CACHE_PREFIX + ticker);
+    if (val === 'yes') return 'yes';
+    if (val === 'no') return 'no';
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const setCached = (ticker: string, result: 'yes' | 'no') => {
+  try {
+    localStorage.setItem(CACHE_PREFIX + ticker, result);
+  } catch {
+    // Storage unavailable — ignore
+  }
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const fetchSingleMarket = async (ticker: string, retryDelay = 2000): Promise<SettlementResult> => {
+  try {
+    const resp = await fetch(`https://api.elections.kalshi.com/trade-api/v2/markets/${ticker}`);
+    if (resp.status === 429) {
+      await sleep(retryDelay);
+      return fetchSingleMarket(ticker, Math.min(retryDelay * 2, 30000));
+    }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const result = data.market?.result;
+    if (result === 'yes' || result === 'no') {
+      setCached(ticker, result);
+      return result;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+export const fetchMarketSettlements = async (
+  tickers: string[],
+  onProgress?: (completed: number, total: number) => void,
+): Promise<Map<string, SettlementResult>> => {
+  const results = new Map<string, SettlementResult>();
+  const unique = [...new Set(tickers)];
+  const BATCH_SIZE = 5;
+  const BATCH_DELAY = 300;
+
+  // Load from cache first
+  const uncached: string[] = [];
+  for (const ticker of unique) {
+    const cached = getCached(ticker);
+    if (cached !== null) {
+      results.set(ticker, cached);
+    } else {
+      uncached.push(ticker);
+    }
+  }
+
+  // Fetch only what's not cached
+  for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
+    const batch = uncached.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(t => fetchSingleMarket(t)));
+    batch.forEach((ticker, idx) => results.set(ticker, batchResults[idx]));
+    onProgress?.(results.size, unique.length);
+    if (i + BATCH_SIZE < uncached.length) await sleep(BATCH_DELAY);
+  }
+
+  // Report final count if we had cached items
+  if (uncached.length === 0) onProgress?.(unique.length, unique.length);
+
+  return results;
+};
+
 // Fetch series → category mapping from Kalshi public API
-export const fetchSeriesCategoryMap = async (): Promise<Map<string, string>> => {
+export const fetchSeriesMetadata = async (): Promise<{ categoryMap: Map<string, string>; frequencyMap: Map<string, string> }> => {
   const resp = await fetch('https://api.elections.kalshi.com/trade-api/v2/series');
   if (!resp.ok) {
     console.error('Failed to fetch series data:', resp.status);
-    return new Map();
+    return { categoryMap: new Map(), frequencyMap: new Map() };
   }
   const data = await resp.json();
-  const map = new Map<string, string>();
+  const categoryMap = new Map<string, string>();
+  const frequencyMap = new Map<string, string>();
   for (const s of data.series || []) {
-    map.set(s.ticker, s.category || 'Uncategorized');
+    categoryMap.set(s.ticker, s.category || 'Uncategorized');
+    if (s.frequency) frequencyMap.set(s.ticker, s.frequency);
   }
-  return map;
+  return { categoryMap, frequencyMap };
 };
 
 // Calculate category stats from matched trades using a series→category map
@@ -151,6 +237,7 @@ export const calculateCategoryStatsFromMatched = (
         eventsTraded: new Set(),
         marketsTraded: new Set(),
         totalCost: 0,
+        totalFees: 0,
         tradesCount: 0,
         winCount: 0,
       });
@@ -162,6 +249,7 @@ export const calculateCategoryStatsFromMatched = (
     if (event) stats.eventsTraded.add(event);
     if (market) stats.marketsTraded.add(market);
     stats.totalCost += trade.Entry_Cost;
+    stats.totalFees += trade.Total_Fees;
     stats.tradesCount++;
     if (trade.Net_Profit > 0) {
       stats.winCount++;
@@ -212,16 +300,18 @@ export const calculateSeriesStatsFromMatched = (matchedTrades: MatchedTrade[]): 
         eventsTraded: new Set(),
         marketsTraded: new Set(),
         totalCost: 0,
+        totalFees: 0,
         tradesCount: 0,
         winCount: 0,
       });
     }
-    
+
     const stats = seriesMap.get(series)!;
     stats.pnl += trade.Net_Profit;
     if (event) stats.eventsTraded.add(event);
     if (market) stats.marketsTraded.add(market);
     stats.totalCost += trade.Entry_Cost;
+    stats.totalFees += trade.Total_Fees;
     stats.tradesCount++;
     if (trade.Net_Profit > 0) {
       stats.winCount++;
@@ -245,11 +335,12 @@ export const calculateSeriesStats = (trades: Trade[]): Map<string, SeriesStats> 
         eventsTraded: new Set(),
         marketsTraded: new Set(),
         totalCost: 0,
+        totalFees: 0,
         tradesCount: 0,
         winCount: 0,
       });
     }
-    
+
     const stats = seriesMap.get(series)!;
     stats.pnl += trade.Realized_Profit;
     if (event) stats.eventsTraded.add(event);

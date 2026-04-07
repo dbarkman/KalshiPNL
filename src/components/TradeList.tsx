@@ -86,6 +86,9 @@ export default function TradeList({ trades }: TradeListProps) {
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Contracts
                 </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Fees
+                </th>
                 <th scope="col" className={headerClass('Net_Profit')} onClick={() => handleHeaderClick('Net_Profit')}>
                   Net Profit{sortIndicator('Net_Profit')}
                 </th>
@@ -114,6 +117,9 @@ export default function TradeList({ trades }: TradeListProps) {
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                     {trade.Contracts}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    ${trade.Total_Fees.toFixed(2)}
                   </td>
                   <td className={`px-6 py-4 whitespace-nowrap text-sm ${trade.Net_Profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                     ${trade.Net_Profit.toFixed(2)}

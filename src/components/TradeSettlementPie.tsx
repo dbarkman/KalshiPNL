@@ -21,8 +21,12 @@ export default function TradeSettlementPie({ matchedTrades }: TradeSettlementPie
     .filter(t => t.Exit_Type !== 'settlement')
     .reduce((sum, t) => sum + t.Contracts, 0);
 
+  const total = settledContracts + soldContracts;
+  const settledPct = total > 0 ? ((settledContracts / total) * 100).toFixed(1) : '0';
+  const soldPct = total > 0 ? ((soldContracts / total) * 100).toFixed(1) : '0';
+
   const data = {
-    labels: ['Settled Contracts', 'Sold Contracts'],
+    labels: [`Settled: ${settledContracts.toLocaleString()} (${settledPct}%)`, `Sold: ${soldContracts.toLocaleString()} (${soldPct}%)`],
     datasets: [
       {
         label: 'Contract Settlement',

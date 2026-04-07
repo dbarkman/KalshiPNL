@@ -2,8 +2,9 @@
 
 import { useState, useRef, useMemo } from 'react';
 import Papa from 'papaparse';
-import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesCategoryMap, parseTickerComponents } from '@/utils/processData';
+import { processCSVData, ProcessedData, combineProcessedData, filterTradesBySeries, Trade, MatchedTrade, fetchSeriesMetadata, fetchMarketSettlements, parseTickerComponents, SettlementResult } from '@/utils/processData';
 import Overview from '@/components/Overview';
+import SettlementWhatIf from './SettlementWhatIf';
 import PnlChart from './PnlChart';
 import TradeDirectionPie from './TradeDirectionPie';
 import TradeSettlementPie from './TradeSettlementPie';
@@ -14,6 +15,7 @@ import SeriesStatsTable from './SeriesStatsTable';
 import CategoryStatsTable from './CategoryStatsTable';
 import TradeNarrative from './TradeNarrative';
 import DailyPnlTable from './DailyPnlTable';
+import MonthlyPnlTable from './MonthlyPnlTable';
 
 interface CsvData {
   headers: string[];
@@ -32,27 +34,50 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [selectedSeries, setSelectedSeries] = useState<string | null>(null);
   const [categoryMap, setCategoryMap] = useState<Map<string, string>>(new Map());
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [frequencyMap, setFrequencyMap] = useState<Map<string, string>>(new Map());
+  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [seriesFilter, setSeriesFilter] = useState<string>('');
+  const [selectedMonths, setSelectedMonths] = useState<Set<string>>(new Set()); // YYYY-MM
+  const [selectedDays, setSelectedDays] = useState<Set<string>>(new Set()); // YYYY-MM-DD
+  const [settlementMap, setSettlementMap] = useState<Map<string, SettlementResult>>(new Map());
+  const [settlementLoading, setSettlementLoading] = useState(false);
+  const [settlementProgress, setSettlementProgress] = useState<{ completed: number; total: number } | null>(null);
   const categoryMapFetched = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const seriesFilterUpper = seriesFilter.toUpperCase();
 
-  // Filter trades by selected category, series name filter, and/or selected series
+  // Helper to check if a date matches the selected month/day filters
+  const matchesDateFilter = (date: Date): boolean => {
+    if (selectedDays.size > 0) {
+      return selectedDays.has(date.toLocaleDateString('en-CA'));
+    }
+    if (selectedMonths.size > 0) {
+      const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      return selectedMonths.has(monthKey);
+    }
+    return true;
+  };
+
+  // Filter trades by selected categories, series name filter, series, month, and/or day
   const filteredData = useMemo(() => {
-    if (!processedData || (!selectedSeries && !selectedCategory && !seriesFilterUpper)) {
+    if (!processedData || (!selectedSeries && selectedCategories.size === 0 && !seriesFilterUpper && selectedMonths.size === 0 && selectedDays.size === 0)) {
       return processedData;
     }
 
     let filteredMatchedTrades = processedData.matchedTrades;
 
-    // Filter by category first
-    if (selectedCategory && categoryMap.size > 0) {
+    // Filter by month/day
+    if (selectedMonths.size > 0 || selectedDays.size > 0) {
+      filteredMatchedTrades = filteredMatchedTrades.filter(trade => matchesDateFilter(trade.Exit_Date));
+    }
+
+    // Filter by category
+    if (selectedCategories.size > 0 && categoryMap.size > 0) {
       filteredMatchedTrades = filteredMatchedTrades.filter(trade => {
         const { series } = parseTickerComponents(trade.Ticker);
         const cat = categoryMap.get(series) || 'Uncategorized';
-        return cat === selectedCategory;
+        return selectedCategories.has(cat);
       });
     }
 
@@ -73,10 +98,13 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     }
 
     const filteredTrades = processedData.trades.filter(trade => {
+      if (selectedMonths.size > 0 || selectedDays.size > 0) {
+        if (!matchesDateFilter(trade.Date)) return false;
+      }
       const { series } = parseTickerComponents(trade.Ticker);
-      if (selectedCategory && categoryMap.size > 0) {
+      if (selectedCategories.size > 0 && categoryMap.size > 0) {
         const cat = categoryMap.get(series) || 'Uncategorized';
-        if (cat !== selectedCategory) return false;
+        if (!selectedCategories.has(cat)) return false;
       }
       if (seriesFilterUpper && !series.toUpperCase().includes(seriesFilterUpper)) return false;
       if (selectedSeries && series !== selectedSeries) return false;
@@ -143,7 +171,72 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
         settledWinRate,
       },
     };
-  }, [processedData, selectedSeries, selectedCategory, categoryMap, seriesFilterUpper]);
+  }, [processedData, selectedSeries, selectedCategories, categoryMap, seriesFilterUpper, selectedMonths, selectedDays]);
+
+  // Trades filtered by category/series but NOT by date — used for Monthly/Daily tables
+  // so they always show all rows available for selection
+  const nonDateFilteredTrades = useMemo(() => {
+    if (!processedData) return [];
+    let trades = processedData.matchedTrades;
+    if (selectedCategories.size > 0 && categoryMap.size > 0) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return selectedCategories.has(categoryMap.get(series) || 'Uncategorized');
+      });
+    }
+    if (seriesFilterUpper) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return series.toUpperCase().includes(seriesFilterUpper);
+      });
+    }
+    if (selectedSeries) {
+      trades = trades.filter(t => t.Ticker.split('-')[0] === selectedSeries);
+    }
+    return trades;
+  }, [processedData, selectedCategories, categoryMap, seriesFilterUpper, selectedSeries]);
+
+  // Last 30 days of trades, filtered by category/series name but NOT user date selection
+  // Used for the trailing 30d avg return column in SeriesStatsTable
+  const recentMatchedTrades = useMemo(() => {
+    if (!processedData) return [];
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    let trades = processedData.matchedTrades.filter(t => t.Exit_Date >= thirtyDaysAgo);
+    if (selectedCategories.size > 0 && categoryMap.size > 0) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return selectedCategories.has(categoryMap.get(series) || 'Uncategorized');
+      });
+    }
+    if (seriesFilterUpper) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return series.toUpperCase().includes(seriesFilterUpper);
+      });
+    }
+    return trades;
+  }, [processedData, selectedCategories, categoryMap, seriesFilterUpper]);
+
+  // Trades filtered by date/series but NOT by category — used for CategoryStatsTable
+  // so all category rows stay visible for selection
+  const nonCategoryFilteredTrades = useMemo(() => {
+    if (!processedData) return [];
+    let trades = processedData.matchedTrades;
+    if (selectedMonths.size > 0 || selectedDays.size > 0) {
+      trades = trades.filter(t => matchesDateFilter(t.Exit_Date));
+    }
+    if (seriesFilterUpper) {
+      trades = trades.filter(t => {
+        const { series } = parseTickerComponents(t.Ticker);
+        return series.toUpperCase().includes(seriesFilterUpper);
+      });
+    }
+    if (selectedSeries) {
+      trades = trades.filter(t => t.Ticker.split('-')[0] === selectedSeries);
+    }
+    return trades;
+  }, [processedData, selectedMonths, selectedDays, seriesFilterUpper, selectedSeries]);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -156,9 +249,12 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
       // Fetch category map once
       if (!categoryMapFetched.current) {
         categoryMapFetched.current = true;
-        fetchSeriesCategoryMap()
-          .then(map => setCategoryMap(map))
-          .catch(err => console.error('Failed to fetch category map:', err));
+        fetchSeriesMetadata()
+          .then(({ categoryMap, frequencyMap }) => {
+            setCategoryMap(categoryMap);
+            setFrequencyMap(frequencyMap);
+          })
+          .catch(err => console.error('Failed to fetch series metadata:', err));
       }
 
       const processedDataArray: ProcessedData[] = [];
@@ -191,13 +287,32 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
 
       if (processedDataArray.length > 0) {
         // Combine all processed data
-        const combinedData = processedDataArray.length === 1 
-          ? processedDataArray[0] 
+        const combinedData = processedDataArray.length === 1
+          ? processedDataArray[0]
           : combineProcessedData(processedDataArray);
 
         setProcessedData(combinedData);
         if (onFileUpload) {
           onFileUpload(combinedData);
+        }
+
+        // Fetch settlement outcomes for all mid-market exits (Exit_Price between 1–99)
+        const earlyExitTickers = [
+          ...new Set(
+            combinedData.matchedTrades
+              .filter(t => t.Exit_Price > 0 && t.Exit_Price < 100)
+              .map(t => t.Ticker)
+          ),
+        ];
+
+        if (earlyExitTickers.length > 0) {
+          setSettlementLoading(true);
+          setSettlementProgress({ completed: 0, total: earlyExitTickers.length });
+          fetchMarketSettlements(earlyExitTickers, (completed, total) => {
+            setSettlementProgress({ completed, total });
+          })
+            .then(map => setSettlementMap(map))
+            .finally(() => setSettlementLoading(false));
         }
       }
     } catch (err) {
@@ -212,8 +327,13 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
     setError('');
     setUploadedFiles([]);
     setSelectedSeries(null);
-    setSelectedCategory(null);
+    setSelectedCategories(new Set());
     setSeriesFilter('');
+    setSelectedMonths(new Set());
+    setSelectedDays(new Set());
+    setSettlementMap(new Map());
+    setSettlementLoading(false);
+    setSettlementProgress(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -312,7 +432,9 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
           <div className="mb-6">
             <h2 className="text-xl font-semibold mb-4 text-center">
               Profit & Loss Over Time
-              {selectedCategory && <span className="text-purple-600 text-base ml-2">({selectedCategory})</span>}
+              {selectedMonths.size > 0 && <span className="text-teal-600 text-base ml-2">({selectedMonths.size === 1 ? Array.from(selectedMonths)[0] : `${selectedMonths.size} months`})</span>}
+              {selectedDays.size > 0 && <span className="text-teal-600 text-base ml-2">({selectedDays.size === 1 ? Array.from(selectedDays)[0] : `${selectedDays.size} days`})</span>}
+              {selectedCategories.size > 0 && <span className="text-purple-600 text-base ml-2">({selectedCategories.size === 1 ? Array.from(selectedCategories)[0] : `${selectedCategories.size} categories`})</span>}
               {seriesFilter && <span className="text-orange-600 text-base ml-2">(~{seriesFilter})</span>}
               {selectedSeries && <span className="text-blue-600 text-base ml-2">({selectedSeries})</span>}
             </h2>
@@ -328,26 +450,84 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             matchedTrades={filteredData.matchedTrades}
           />
 
+          <SettlementWhatIf
+            matchedTrades={filteredData.matchedTrades}
+            settlementMap={settlementMap}
+            loading={settlementLoading}
+            progress={settlementProgress}
+          />
+
           <TradeNarrative
             matchedTrades={processedData!.matchedTrades}
             basicStats={processedData!.basicStats}
             categoryMap={categoryMap}
           />
 
-          <DailyPnlTable matchedTrades={filteredData.matchedTrades} />
+          <MonthlyPnlTable
+            matchedTrades={nonDateFilteredTrades}
+            selectedMonths={selectedMonths}
+            onMonthSelect={(month, metaKey) => {
+              if (month === null) {
+                setSelectedMonths(new Set());
+                setSelectedDays(new Set());
+              } else if (metaKey) {
+                setSelectedMonths(prev => {
+                  const next = new Set(prev);
+                  if (next.has(month)) next.delete(month);
+                  else next.add(month);
+                  return next;
+                });
+                setSelectedDays(new Set());
+              } else {
+                setSelectedMonths(prev => prev.size === 1 && prev.has(month) ? new Set() : new Set([month]));
+                setSelectedDays(new Set());
+              }
+            }}
+          />
+
+          <DailyPnlTable
+            matchedTrades={nonDateFilteredTrades}
+            selectedDays={selectedDays}
+            onDaySelect={(day, metaKey) => {
+              if (day === null) {
+                setSelectedDays(new Set());
+              } else if (metaKey) {
+                // CMD+click toggles individual days
+                setSelectedDays(prev => {
+                  const next = new Set(prev);
+                  if (next.has(day)) {
+                    next.delete(day);
+                  } else {
+                    next.add(day);
+                  }
+                  return next;
+                });
+              } else {
+                // Regular click: toggle single day
+                setSelectedDays(prev => prev.size === 1 && prev.has(day) ? new Set() : new Set([day]));
+              }
+            }}
+          />
 
           {categoryMap.size > 0 && (
             <CategoryStatsTable
-              matchedTrades={processedData!.matchedTrades}
+              matchedTrades={nonCategoryFilteredTrades}
               categoryMap={categoryMap}
-              selectedCategory={selectedCategory}
-              onCategorySelect={(cat) => {
+              selectedCategories={selectedCategories}
+              onCategorySelect={(cat, metaKey) => {
                 if (cat === null) {
-                  // Clearing category also clears series
-                  setSelectedCategory(null);
+                  setSelectedCategories(new Set());
+                  setSelectedSeries(null);
+                } else if (metaKey) {
+                  setSelectedCategories(prev => {
+                    const next = new Set(prev);
+                    if (next.has(cat)) next.delete(cat);
+                    else next.add(cat);
+                    return next;
+                  });
                   setSelectedSeries(null);
                 } else {
-                  setSelectedCategory(cat);
+                  setSelectedCategories(prev => prev.size === 1 && prev.has(cat) ? new Set() : new Set([cat]));
                   setSelectedSeries(null);
                 }
               }}
@@ -355,16 +535,34 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
           )}
 
           <SeriesStatsTable
-            matchedTrades={processedData!.matchedTrades.filter(t => {
-              const { series } = parseTickerComponents(t.Ticker);
-              if (selectedCategory && categoryMap.size > 0) {
-                if ((categoryMap.get(series) || 'Uncategorized') !== selectedCategory) return false;
+            recentMatchedTrades={recentMatchedTrades}
+            allMatchedTrades={processedData!.matchedTrades}
+            matchedTrades={(() => {
+              // Filter by date + category + series name filter, but NOT selected series
+              // (so all series remain visible for selection)
+              let trades = processedData!.matchedTrades;
+              if (selectedMonths.size > 0 || selectedDays.size > 0) {
+                trades = trades.filter(t => matchesDateFilter(t.Exit_Date));
               }
-              if (seriesFilterUpper && !series.toUpperCase().includes(seriesFilterUpper)) return false;
-              return true;
-            })}
+              if (selectedCategories.size > 0 && categoryMap.size > 0) {
+                trades = trades.filter(t => {
+                  const { series } = parseTickerComponents(t.Ticker);
+                  return selectedCategories.has(categoryMap.get(series) || 'Uncategorized');
+                });
+              }
+              if (seriesFilterUpper) {
+                trades = trades.filter(t => {
+                  const { series } = parseTickerComponents(t.Ticker);
+                  return series.toUpperCase().includes(seriesFilterUpper);
+                });
+              }
+              return trades;
+            })()}
             selectedSeries={selectedSeries}
             onSeriesSelect={setSelectedSeries}
+            frequencyMap={frequencyMap}
+            categoryMap={categoryMap}
+            settlementMap={settlementMap}
             seriesFilter={seriesFilter}
             onSeriesFilterChange={(val) => {
               setSeriesFilter(val);
@@ -399,7 +597,7 @@ export default function CsvUploader({ onFileUpload }: CsvUploaderProps) {
             </div>
           </div>
           
-          {(selectedSeries || selectedCategory || seriesFilter) && <TradeList trades={filteredData.matchedTrades} />}
+          {(selectedSeries || selectedCategories.size > 0 || seriesFilter || selectedMonths.size > 0 || selectedDays.size > 0) && <TradeList trades={filteredData.matchedTrades} />}
         </div>
       )}
 

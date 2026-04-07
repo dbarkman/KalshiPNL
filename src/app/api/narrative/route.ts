@@ -3,13 +3,25 @@ import { spawn } from 'child_process';
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
+  const { stats, messages } = body;
 
-  const prompt = `You are a concise trading performance analyst. Given the following Kalshi prediction market trading data, write a 3-5 paragraph narrative summary of the trader's performance. Be specific with numbers. Call out strengths, weaknesses, patterns, and actionable insights. Keep it direct and useful — no fluff.
+  // Build conversation for the CLI
+  const systemContext = `You are a concise trading performance analyst for Kalshi prediction markets. You have access to the following trading data. Answer questions specifically using the numbers. Be direct and useful — no fluff. Keep responses to 2-3 short paragraphs max.
 
 Trading Stats:
-${JSON.stringify(body, null, 2)}
+${JSON.stringify(stats, null, 2)}`;
 
-Write the summary in plain text (no markdown headers, no bullet lists). Use short paragraphs.`;
+  // Build the full prompt with conversation history
+  const conversationParts = [systemContext, ''];
+  for (const msg of messages) {
+    if (msg.role === 'user') {
+      conversationParts.push(`User: ${msg.content}`);
+    } else {
+      conversationParts.push(`Assistant: ${msg.content}`);
+    }
+  }
+
+  const prompt = conversationParts.join('\n\n');
 
   try {
     const text = await runClaude(prompt);
@@ -17,7 +29,7 @@ Write the summary in plain text (no markdown headers, no bullet lists). Use shor
   } catch (err) {
     console.error('Claude CLI error:', err);
     return NextResponse.json(
-      { error: 'Failed to generate narrative. Make sure the claude CLI is installed and authenticated.' },
+      { error: 'Failed to generate response. Make sure the claude CLI is installed and authenticated.' },
       { status: 500 },
     );
   }

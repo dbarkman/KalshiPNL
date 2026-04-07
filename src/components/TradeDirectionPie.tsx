@@ -12,8 +12,12 @@ interface TradeDirectionPieProps {
 }
 
 export default function TradeDirectionPie({ yesCount, noCount }: TradeDirectionPieProps) {
+  const total = yesCount + noCount;
+  const yesPct = total > 0 ? ((yesCount / total) * 100).toFixed(1) : '0';
+  const noPct = total > 0 ? ((noCount / total) * 100).toFixed(1) : '0';
+
   const data = {
-    labels: ['YES Trades', 'NO Trades'],
+    labels: [`YES: ${yesCount.toLocaleString()} (${yesPct}%)`, `NO: ${noCount.toLocaleString()} (${noPct}%)`],
     datasets: [
       {
         label: 'Trade Direction',

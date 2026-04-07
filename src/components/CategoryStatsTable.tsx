@@ -1,19 +1,19 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
-import { MatchedTrade, CategoryStats, calculateCategoryStatsFromMatched } from '@/utils/processData';
+import { MatchedTrade, calculateCategoryStatsFromMatched } from '@/utils/processData';
 
 interface CategoryStatsTableProps {
   matchedTrades: MatchedTrade[];
   categoryMap: Map<string, string>;
-  selectedCategory: string | null;
-  onCategorySelect: (category: string | null) => void;
+  selectedCategories: Set<string>;
+  onCategorySelect: (category: string | null, metaKey: boolean) => void;
 }
 
-type SortField = 'category' | 'pnl' | 'series' | 'trades' | 'avgReturn' | 'winRate';
+type SortField = 'category' | 'pnl' | 'proceeds' | 'cost' | 'fees' | 'trades' | 'winRate' | 'avgReturn';
 type SortDirection = 'asc' | 'desc';
 
-export default function CategoryStatsTable({ matchedTrades, categoryMap, selectedCategory, onCategorySelect }: CategoryStatsTableProps) {
+export default function CategoryStatsTable({ matchedTrades, categoryMap, selectedCategories, onCategorySelect }: CategoryStatsTableProps) {
   const [sortField, setSortField] = useState<SortField>('pnl');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
 
@@ -23,8 +23,9 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
     return Array.from(statsMap.values()).map(stats => ({
       category: stats.category,
       pnl: stats.pnl,
-      seriesCount: stats.seriesTraded.size,
-      eventsCount: stats.eventsTraded.size,
+      proceeds: stats.totalCost + stats.pnl + stats.totalFees,
+      totalCost: stats.totalCost,
+      fees: stats.totalFees,
       tradesCount: stats.tradesCount,
       avgReturn: stats.totalCost > 0 ? stats.pnl / stats.totalCost : 0,
       winRate: stats.tradesCount > 0 ? stats.winCount / stats.tradesCount : 0,
@@ -39,7 +40,9 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
       switch (sortField) {
         case 'category': aVal = a.category; bVal = b.category; break;
         case 'pnl': aVal = a.pnl; bVal = b.pnl; break;
-        case 'series': aVal = a.seriesCount; bVal = b.seriesCount; break;
+        case 'proceeds': aVal = a.proceeds; bVal = b.proceeds; break;
+        case 'cost': aVal = a.totalCost; bVal = b.totalCost; break;
+        case 'fees': aVal = a.fees; bVal = b.fees; break;
         case 'trades': aVal = a.tradesCount; bVal = b.tradesCount; break;
         case 'avgReturn': aVal = a.avgReturn; bVal = b.avgReturn; break;
         case 'winRate': aVal = a.winRate; bVal = b.winRate; break;
@@ -47,9 +50,7 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
       }
 
       if (typeof aVal === 'string' && typeof bVal === 'string') {
-        return sortDirection === 'asc'
-          ? aVal.localeCompare(bVal)
-          : bVal.localeCompare(aVal);
+        return sortDirection === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
       }
 
       return sortDirection === 'asc'
@@ -85,34 +86,22 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
   };
 
   const SortIcon = ({ field }: { field: SortField }) => {
-    if (sortField !== field) {
-      return <span className="ml-1 text-gray-300">↕</span>;
-    }
+    if (sortField !== field) return <span className="ml-1 text-gray-300">↕</span>;
     return <span className="ml-1">{sortDirection === 'asc' ? '↑' : '↓'}</span>;
   };
 
-  const handleRowClick = (category: string) => {
-    if (selectedCategory === category) {
-      onCategorySelect(null);
-    } else {
-      onCategorySelect(category);
-    }
-  };
-
-  if (categoryData.length === 0) {
-    return null;
-  }
+  if (categoryData.length === 0) return null;
 
   return (
     <div className="mt-6">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-xl font-semibold">Category Performance</h2>
-        {selectedCategory && (
+        {selectedCategories.size > 0 && (
           <button
-            onClick={() => onCategorySelect(null)}
+            onClick={() => onCategorySelect(null, false)}
             className="flex items-center gap-2 px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full text-sm font-medium hover:bg-purple-100 transition-colors"
           >
-            <span>Filtering: {selectedCategory}</span>
+            <span>Filtering: {selectedCategories.size === 1 ? Array.from(selectedCategories)[0] : `${selectedCategories.size} categories`}</span>
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
@@ -124,47 +113,29 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('category')}
-                >
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('category')}>
                   Category <SortIcon field="category" />
                 </th>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('pnl')}
-                >
-                  PNL <SortIcon field="pnl" />
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('proceeds')}>
+                  Proceeds <SortIcon field="proceeds" />
                 </th>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('series')}
-                >
-                  Series <SortIcon field="series" />
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('cost')}>
+                  Cost <SortIcon field="cost" />
                 </th>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('trades')}
-                >
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('fees')}>
+                  Fees <SortIcon field="fees" />
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('pnl')}>
+                  Net Profit <SortIcon field="pnl" />
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('trades')}>
                   Trades <SortIcon field="trades" />
                 </th>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('avgReturn')}
-                >
-                  Avg Return <SortIcon field="avgReturn" />
-                </th>
-                <th
-                  scope="col"
-                  className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                  onClick={() => handleSort('winRate')}
-                >
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('winRate')}>
                   Win Rate <SortIcon field="winRate" />
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" onClick={() => handleSort('avgReturn')}>
+                  Avg Return <SortIcon field="avgReturn" />
                 </th>
               </tr>
             </thead>
@@ -172,34 +143,20 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
               {sortedData.map((row) => (
                 <tr
                   key={row.category}
-                  onClick={() => handleRowClick(row.category)}
-                  className={`cursor-pointer transition-colors ${
-                    selectedCategory === row.category
-                      ? 'bg-purple-50 hover:bg-purple-100'
-                      : 'hover:bg-gray-50'
-                  }`}
+                  onClick={(e) => onCategorySelect(row.category, e.metaKey || e.ctrlKey)}
+                  className={`cursor-pointer transition-colors ${selectedCategories.has(row.category) ? 'bg-purple-50 hover:bg-purple-100' : 'hover:bg-gray-50'}`}
                 >
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                    {row.category}
-                  </td>
-                  <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${
-                    row.pnl >= 0 ? 'text-green-600' : 'text-red-600'
-                  }`}>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{row.category}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{formatCurrency(row.proceeds)}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{formatCurrency(row.totalCost)}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{formatCurrency(row.fees)}</td>
+                  <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${row.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                     {formatCurrency(row.pnl)}
                   </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {row.seriesCount}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {row.tradesCount}
-                  </td>
-                  <td className={`px-6 py-4 whitespace-nowrap text-sm ${
-                    row.avgReturn >= 0 ? 'text-green-600' : 'text-red-600'
-                  }`}>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{row.tradesCount}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{formatPercent(row.winRate)}</td>
+                  <td className={`px-6 py-4 whitespace-nowrap text-sm ${row.avgReturn >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                     {formatPercent(row.avgReturn)}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {formatPercent(row.winRate)}
                   </td>
                 </tr>
               ))}
@@ -207,7 +164,7 @@ export default function CategoryStatsTable({ matchedTrades, categoryMap, selecte
           </table>
         </div>
         <div className="px-6 py-3 bg-gray-50 text-xs text-gray-500">
-          Click a category to filter all data. Click again to clear filter.
+          Click a category to filter. Cmd+click to select multiple. Click again to deselect.
         </div>
       </div>
     </div>
