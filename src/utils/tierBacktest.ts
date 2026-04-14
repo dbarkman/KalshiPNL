@@ -151,32 +151,32 @@ export function backtestTiers(
       let moved: 'up' | 'down' | null = null;
       const prevTier = tier;
 
-      if (active) {
-        if (dayIdx < 3) {
-          // Starter days 1–3: stay at 1¢, update counter
-          if (r30 !== null) {
-            if (r30 >= 0) consecutive += 1;
-            else consecutive = 0;
-          }
-          // tier remains 1
-        } else {
-          // Day 4+: ladder active
-          if (r30 !== null) {
-            if (r30 < 0) {
-              tier = ladderDown(tier);
-              consecutive = 0;
-            } else {
-              consecutive += 1;
-              if (consecutive >= 3) {
-                tier = ladderUp(tier);
-                consecutive = 0;
-              }
-            }
-          }
-          // r30 null → hold
+      // Asymmetric rule:
+      //   Demotion runs on any calendar day (dormant or active) when r30 < 0 — risk signal, no new evidence needed.
+      //   Promotion runs only on active days with 3 consecutive r30 ≥ 0 readings — requires new positive evidence.
+      if (dayIdx < 3) {
+        // Starter days 1–3: tier pinned at 1¢ (can't go lower), only accrue counter on active days
+        if (active && r30 !== null) {
+          if (r30 >= 0) consecutive += 1;
+          else consecutive = 0;
         }
+        // tier remains 1
+      } else {
+        // Day 4+: ladder active
+        if (r30 !== null && r30 < 0) {
+          // Demote on any day with a negative r30 signal
+          tier = ladderDown(tier);
+          consecutive = 0;
+        } else if (active && r30 !== null && r30 >= 0) {
+          // Promote only on active days with positive r30
+          consecutive += 1;
+          if (consecutive >= 3) {
+            tier = ladderUp(tier);
+            consecutive = 0;
+          }
+        }
+        // else (r30 null, or dormant with non-negative r30) → hold
       }
-      // inactive day → hold, no counter/tier change
 
       if (tier > prevTier) moved = 'up';
       else if (tier < prevTier) moved = 'down';
