@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
+import { backtestTiers, summarizeTierDistribution, TIER_LADDER, SeriesBacktest } from '@/utils/tierBacktest';
 
 interface SeriesStatsTableProps {
   matchedTrades: MatchedTrade[];
@@ -24,6 +25,8 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [sqlModal, setSqlModal] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [backtestModal, setBacktestModal] = useState<Map<string, SeriesBacktest> | null>(null);
+  const [backtestSelectedSeries, setBacktestSelectedSeries] = useState<string | null>(null);
 
   const trailing30dMap = useMemo(() => {
     const statsMap = calculateSeriesStatsFromMatched(recentMatchedTrades);
@@ -148,11 +151,25 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     // All-time stats for tradesCount and pnl
     const allSeriesStats = calculateSeriesStatsFromMatched(allMatchedTrades);
 
+    // Run backtest for per-event (weekly/daily/hourly/fifteen_min) series
+    const backtest = backtestTiers(allMatchedTrades, frequencyMap ?? new Map(), categoryMap ?? new Map());
+
+    const fmtPct = (v: number) => (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+    const fmtTier = (t: number) => `${t}¢`;
+    const r30Str = (r: number | null) => r !== null ? `r30 ${fmtPct(r)}` : 'no r30';
+
     const toDelete: string[] = [];
-    const full: string[] = [];       // NULL
-    const monitoring: string[] = []; // 100¢
-    const aggressive: string[] = []; // 1¢
-    const stinkers: string[] = [];   // enabled = 0
+    const stinkers: string[] = [];
+
+    // Per-event tier buckets (ladder). Each entry: {series, comment}
+    type BucketEntry = { series: string; comment: string };
+    const tierBuckets = new Map<number, BucketEntry[]>();
+    TIER_LADDER.forEach(t => tierBuckets.set(t, []));
+
+    // Monthly buckets — retire NULL, top tier is now 200¢
+    const monthlyTop: BucketEntry[] = [];        // 200¢
+    const monthlyMonitoring: BucketEntry[] = []; // 100¢
+    const monthlyAggressive: BucketEntry[] = []; // 1¢
 
     const MANUAL_ONLY = new Set(['one_off', 'annual', 'custom']);
 
@@ -201,36 +218,57 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
           stinkers.push(series);
         }
         if (daysSinceFirst < 7) return; // too new — skip, preserve manually-set position
-        if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
-          full.push(series);
+        // Mentions: always 100¢
+        if (categoryMap?.get(series) === 'Mentions') {
+          monthlyMonitoring.push({ series, comment: 'mention pinned' });
+        } else if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
+          monthlyTop.push({ series, comment: `monthly +${r30Str(r30)}` });
         } else if (r30 !== null && r30 < 0 && stats.tradesCount >= 2) {
-          aggressive.push(series);
+          monthlyAggressive.push({ series, comment: `monthly ${r30Str(r30)}` });
         } else {
-          // <2 trades or no 30d data — conservative hold at 100¢
-          monitoring.push(series);
+          monthlyMonitoring.push({ series, comment: `<2 trades or no 30d data — hold` });
         }
       } else {
-        // weekly / daily / hourly
-        // Stinker: 90+ days, 30+ trades, all-time negative
+        // weekly / daily / hourly / fifteen_min — use backtest
         if (daysSinceFirst >= 90 && stats.tradesCount >= 30 && stats.pnl < 0) {
           stinkers.push(series);
         }
-        if (daysSinceFirst < 7) {
-          aggressive.push(series);
-        } else if (r30 !== null && r30 >= 0 && stats.tradesCount >= 20) {
-          full.push(series);
-        } else if (r30 !== null && r30 >= 0) {
-          monitoring.push(series);
-        } else if (r30 !== null && r30 < 0) {
-          aggressive.push(series);
-        } else {
-          // no 30d data — conservative
-          monitoring.push(series);
+
+        const bt = backtest.get(series);
+        if (!bt) {
+          // No backtest result (shouldn't happen given freq check) — fall back to 1¢ starter
+          tierBuckets.get(1)!.push({ series, comment: 'no backtest data — default 1¢' });
+          return;
         }
+
+        const last = bt.history[bt.history.length - 1];
+        let comment: string;
+
+        if (bt.daysTracked <= 3) {
+          // Still in starter window
+          comment = `starter day ${bt.daysTracked}`;
+        } else if (last.moved === 'up') {
+          comment = `↑ promoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
+        } else if (last.moved === 'down') {
+          comment = `↓ demoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
+        } else if (!last.active) {
+          comment = `dormant (${r30Str(last.r30)})`;
+        } else {
+          comment = `hold (${r30Str(last.r30)})`;
+        }
+
+        tierBuckets.get(bt.currentTier)!.push({ series, comment });
       }
     });
 
-    // Series not found in DB are silently skipped by WHERE IN — no special handling needed
+    // SQL helpers
+    const emitInBlock = (entries: BucketEntry[]): string => {
+      const sorted = [...entries].sort((a, b) => a.series.localeCompare(b.series));
+      return sorted.map((e, i) => {
+        const isLast = i === sorted.length - 1;
+        return `  '${e.series}'${isLast ? '' : ','} -- ${e.comment}`;
+      }).join('\n');
+    };
     const toIn = (arr: string[]) => arr.map(s => `'${s}'`).join(',\n  ');
     const parts: string[] = [];
 
@@ -240,27 +278,40 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         `DELETE FROM one_cent_series_filters\nWHERE series_ticker IN (\n  ${toIn(toDelete)}\n);`
       );
     }
-    if (full.length) {
+
+    // Per-event ladder tiers, ascending 1¢ → 200¢
+    TIER_LADDER.forEach(tier => {
+      const bucket = tierBuckets.get(tier)!;
+      if (!bucket.length) return;
       parts.push(
-        `-- NULL: positive 30d + 7+ days + 20+ trades (weekly/daily/hourly) or 2+ trades (monthly) — ${full.length} series\n` +
-        `UPDATE one_cent_series_filters\nSET position_size_cents = NULL\nWHERE series_ticker IN (\n  ${toIn(full)}\n);`
+        `-- ${fmtTier(tier)} tier (per-event ladder) — ${bucket.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = ${tier} WHERE series_ticker IN (\n${emitInBlock(bucket)}\n);`
+      );
+    });
+
+    // Monthly tiers
+    if (monthlyTop.length) {
+      parts.push(
+        `-- 200¢ (monthly top) — positive 30d, 7+ days, 2+ trades — ${monthlyTop.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 200 WHERE series_ticker IN (\n${emitInBlock(monthlyTop)}\n);`
       );
     }
-    if (monitoring.length) {
+    if (monthlyMonitoring.length) {
       parts.push(
-        `-- 100¢: positive 30d + 7+ days + <20 trades (weekly/daily/hourly) or <2 trades/no data (monthly) — ${monitoring.length} series\n` +
-        `UPDATE one_cent_series_filters\nSET position_size_cents = 100\nWHERE series_ticker IN (\n  ${toIn(monitoring)}\n);`
+        `-- 100¢ (monthly monitoring / mentions / no data) — ${monthlyMonitoring.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 100 WHERE series_ticker IN (\n${emitInBlock(monthlyMonitoring)}\n);`
       );
     }
-    if (aggressive.length) {
+    if (monthlyAggressive.length) {
       parts.push(
-        `-- 1¢: negative 30d (2+ trades for monthly) or <7 calendar days (weekly/daily/hourly) — ${aggressive.length} series\n` +
-        `UPDATE one_cent_series_filters\nSET position_size_cents = 1\nWHERE series_ticker IN (\n  ${toIn(aggressive)}\n);`
+        `-- 1¢ (monthly aggressive) — negative 30d, 2+ trades — ${monthlyAggressive.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 1 WHERE series_ticker IN (\n${emitInBlock(monthlyAggressive)}\n);`
       );
     }
+
     if (stinkers.length) {
       parts.push(
-        `-- Disable stinkers: 90d+/30t+ (weekly/daily/hourly) or 180d+/6t+ (monthly), all-time negative — ${stinkers.length} series\n` +
+        `-- Disable stinkers: 90d+/30t+ (per-event) or 180d+/6t+ (monthly), all-time negative — ${stinkers.length} series\n` +
         `-- Weather markets excluded by category check\n` +
         `UPDATE one_cent_series_filters\nSET enabled = 0\nWHERE series_ticker IN (\n  ${toIn(stinkers)}\n)\nAND category != 'Climate and Weather';`
       );
@@ -329,6 +380,13 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const runBacktest = () => {
+    if (!frequencyMap || !categoryMap) return;
+    const result = backtestTiers(allMatchedTrades, frequencyMap, categoryMap);
+    setBacktestModal(result);
+    setBacktestSelectedSeries(null);
+  };
+
   if (seriesData.length === 0 && !onSeriesFilterChange) return null;
 
   return (
@@ -338,20 +396,35 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         <div className="flex items-center gap-3">
           {seriesData.length > 0 && (() => {
             const missingFrequency = !frequencyMap || frequencyMap.size === 0;
+            const missingCategory = !categoryMap || categoryMap.size === 0;
             const missingSettlement = !settlementMap || settlementMap.size === 0;
-            const disabled = missingFrequency || missingSettlement;
-            const tooltip = disabled
+            const sqlDisabled = missingFrequency || missingSettlement;
+            const backtestDisabled = missingFrequency || missingCategory;
+            const sqlTooltip = sqlDisabled
               ? [missingFrequency && 'frequency data', missingSettlement && 'settlement data'].filter(Boolean).join(' and ') + ' not yet loaded'
               : '';
+            const backtestTooltip = backtestDisabled
+              ? [missingFrequency && 'frequency data', missingCategory && 'category data'].filter(Boolean).join(' and ') + ' not yet loaded'
+              : 'Simulate ladder tier path for each series from first trade to today';
             return (
-              <button
-                onClick={generateSQL}
-                disabled={disabled}
-                title={tooltip}
-                className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${disabled ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-gray-800 text-white hover:bg-gray-700'}`}
-              >
-                Generate SQL
-              </button>
+              <>
+                <button
+                  onClick={runBacktest}
+                  disabled={backtestDisabled}
+                  title={backtestTooltip}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${backtestDisabled ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-purple-600 text-white hover:bg-purple-700'}`}
+                >
+                  Run Backtest
+                </button>
+                <button
+                  onClick={generateSQL}
+                  disabled={sqlDisabled}
+                  title={sqlTooltip}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${sqlDisabled ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-gray-800 text-white hover:bg-gray-700'}`}
+                >
+                  Generate SQL
+                </button>
+              </>
             );
           })()}
           {onSeriesFilterChange && (
@@ -467,6 +540,107 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         </div>
       </div>
 
+      {backtestModal !== null && (() => {
+        const distribution = summarizeTierDistribution(backtestModal);
+        const selected = backtestSelectedSeries ? backtestModal.get(backtestSelectedSeries) : null;
+        const allSorted = Array.from(backtestModal.values()).sort((a, b) => {
+          if (a.currentTier !== b.currentTier) return a.currentTier - b.currentTier;
+          return a.series.localeCompare(b.series);
+        });
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[85vh]">
+              <div className="flex items-center justify-between px-6 py-4 border-b">
+                <h3 className="text-lg font-semibold">Ladder Backtest — {backtestModal.size} series</h3>
+                <button onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+              </div>
+              <div className="px-6 py-3 border-b bg-gray-50 text-xs text-gray-600">
+                Ladder: {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}. 3 consecutive days r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢.
+              </div>
+              <div className="flex-1 overflow-auto">
+                <div className="grid grid-cols-10 gap-px bg-gray-200 border-b">
+                  {distribution.map(d => (
+                    <div key={d.tier} className="bg-white px-2 py-2 text-center">
+                      <div className="text-xs text-gray-500">{d.tier === 1 ? '1¢' : `${d.tier}¢`}</div>
+                      <div className={`text-lg font-semibold ${d.count === 0 ? 'text-gray-300' : 'text-gray-900'}`}>{d.count}</div>
+                    </div>
+                  ))}
+                </div>
+                {selected ? (
+                  <div className="p-6">
+                    <button onClick={() => setBacktestSelectedSeries(null)} className="text-sm text-blue-600 hover:underline mb-3">← Back to all series</button>
+                    <div className="mb-3">
+                      <h4 className="text-lg font-semibold">{selected.series}</h4>
+                      <div className="text-xs text-gray-500">
+                        Frequency: <span className="font-medium">{selected.frequency}</span> · First trade: {selected.firstTradeDate} · {selected.totalTrades} trades · {selected.daysTracked} days tracked · Current tier: <span className="font-semibold">{selected.currentTier === 1 ? '1¢' : `${selected.currentTier}¢`}</span>
+                      </div>
+                    </div>
+                    <table className="min-w-full text-xs">
+                      <thead className="bg-gray-50 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Date</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Tier</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">r30</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Streak</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Move</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {selected.history.map((h, i) => (
+                          <tr key={i} className={h.moved ? 'bg-yellow-50' : ''}>
+                            <td className="px-3 py-1 font-mono text-gray-700">{h.date}</td>
+                            <td className="px-3 py-1 font-semibold">{h.tier === 1 ? '1¢' : `${h.tier}¢`}</td>
+                            <td className={`px-3 py-1 ${h.r30 === null ? 'text-gray-300' : h.r30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {h.r30 === null ? '—' : formatPercent(h.r30)}
+                            </td>
+                            <td className="px-3 py-1 text-gray-500">{h.consecutivePositive}</td>
+                            <td className={`px-3 py-1 font-medium ${h.moved === 'up' ? 'text-green-700' : h.moved === 'down' ? 'text-red-700' : 'text-gray-400'}`}>
+                              {h.moved === 'up' ? '↑ promoted' : h.moved === 'down' ? '↓ demoted' : '—'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <table className="min-w-full text-xs">
+                    <thead className="bg-gray-50 sticky top-0">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Series</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Freq</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">First Trade</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Days</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Trades</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Current Tier</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">Last r30</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {allSorted.map(bt => (
+                        <tr key={bt.series} className="hover:bg-blue-50 cursor-pointer" onClick={() => setBacktestSelectedSeries(bt.series)}>
+                          <td className="px-3 py-1 font-medium text-blue-700">{bt.series}</td>
+                          <td className="px-3 py-1 text-gray-500">{bt.frequency}</td>
+                          <td className="px-3 py-1 font-mono text-gray-500">{bt.firstTradeDate}</td>
+                          <td className="px-3 py-1 text-gray-500">{bt.daysTracked}</td>
+                          <td className="px-3 py-1 text-gray-500">{bt.totalTrades}</td>
+                          <td className="px-3 py-1 font-semibold">{bt.currentTier === 1 ? '1¢' : `${bt.currentTier}¢`}</td>
+                          <td className={`px-3 py-1 ${bt.lastR30 === null ? 'text-gray-300' : bt.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                            {bt.lastR30 === null ? '—' : formatPercent(bt.lastR30)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+              <div className="px-6 py-3 border-t text-xs text-gray-500 bg-gray-50">
+                Click a series to see its day-by-day tier history. Click Back to return.
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {sqlModal !== null && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[80vh]">
@@ -475,12 +649,10 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               <button onClick={() => setSqlModal(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="px-6 py-2 text-xs text-gray-500 border-b bg-gray-50">
-              <span className="font-medium text-gray-700">DELETE</span> — inactive 30d (daily/hourly), 60d (weekly), 90d (monthly); one_off/annual/custom/unknown never deleted &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">one_off/annual/custom</span> — manual only, no tiers &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">NULL</span> — positive 30d, 7+ days, 20+ trades (w/d/h) or 2+ trades (mo) &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">100¢</span> — positive 30d, 7+ days, &lt;20 trades (w/d/h) or &lt;2 trades (mo) &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">1¢</span> — negative 30d or &lt;7 days &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">disabled</span> — 90d/30t (w/d/h) or 180d/6t (mo), all-time negative (non-weather)
+              <span className="font-medium text-gray-700">Per-event ladder</span> (w/d/h/15m): 1¢→10→25→50→75→100→125→150→175→200¢. Days 1–3 at 1¢; then 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. Inactive days hold. &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Monthly</span>: 200¢ (positive 30d + 2+ trades), 100¢ (mentions / no data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">DELETE</span> — inactive 30d (daily/hourly), 60d (weekly), 90d (monthly); one_off/annual/custom never deleted. &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Disabled stinkers</span> — 90d/30t (per-event) or 180d/6t (monthly), all-time negative (non-weather).
             </div>
             <textarea
               readOnly
