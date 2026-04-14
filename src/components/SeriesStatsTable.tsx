@@ -218,9 +218,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
           stinkers.push(series);
         }
         if (daysSinceFirst < 7) return; // too new — skip, preserve manually-set position
-        // Mentions: always 100¢
+        // Mentions: always 200¢ (empirical sweet spot; cliff for Mentions is at 500¢, so 200¢ is safely below)
         if (categoryMap?.get(series) === 'Mentions') {
-          monthlyMonitoring.push({ series, comment: 'mention pinned' });
+          monthlyTop.push({ series, comment: 'mention pinned' });
         } else if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
           monthlyTop.push({ series, comment: `monthly +${r30Str(r30)}` });
         } else if (r30 !== null && r30 < 0 && stats.tradesCount >= 2) {
@@ -651,7 +651,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
             </div>
             <div className="px-6 py-2 text-xs text-gray-500 border-b bg-gray-50">
               <span className="font-medium text-gray-700">Per-event ladder</span> (w/d/h/15m): 1¢→10→25→50→75→100→125→150→175→200¢. Days 1–3 at 1¢; then 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. Inactive days hold. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Monthly</span>: 200¢ (positive 30d + 2+ trades), 100¢ (mentions / no data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Monthly</span>: 200¢ (positive 30d + 2+ trades, or mentions pinned), 100¢ (no 30d data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">DELETE</span> — inactive 30d (daily/hourly), 60d (weekly), 90d (monthly); one_off/annual/custom never deleted. &nbsp;·&nbsp;
               <span className="font-medium text-gray-700">Disabled stinkers</span> — 90d/30t (per-event) or 180d/6t (monthly), all-time negative (non-weather).
             </div>
