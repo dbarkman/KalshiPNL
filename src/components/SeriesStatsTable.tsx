@@ -244,6 +244,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         const last = bt.history[bt.history.length - 1];
         let comment: string;
 
+        const daysAgo = Math.floor(daysSinceLast);
+        const lastTradeStr = daysAgo === 0 ? 'last trade today' : daysAgo === 1 ? 'last trade 1 day ago' : `last trade ${daysAgo} days ago`;
+
         if (bt.daysTracked <= 3) {
           // Still in starter window
           comment = `starter day ${bt.daysTracked}`;
@@ -251,10 +254,8 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
           comment = `↑ promoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
         } else if (last.moved === 'down') {
           comment = `↓ demoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
-        } else if (!last.active) {
-          comment = `dormant (${r30Str(last.r30)})`;
         } else {
-          comment = `hold (${r30Str(last.r30)})`;
+          comment = `${lastTradeStr} (${r30Str(last.r30)})`;
         }
 
         tierBuckets.get(bt.currentTier)!.push({ series, comment });
@@ -544,7 +545,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         const distribution = summarizeTierDistribution(backtestModal);
         const selected = backtestSelectedSeries ? backtestModal.get(backtestSelectedSeries) : null;
         const allSorted = Array.from(backtestModal.values()).sort((a, b) => {
-          if (a.currentTier !== b.currentTier) return a.currentTier - b.currentTier;
+          if (a.currentTier !== b.currentTier) return b.currentTier - a.currentTier;
           return a.series.localeCompare(b.series);
         });
         return (
