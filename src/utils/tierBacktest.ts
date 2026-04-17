@@ -3,19 +3,8 @@ import { MatchedTrade, parseTickerComponents } from './processData';
 export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200] as const;
 export type Tier = typeof TIER_LADDER[number];
 
-const CUSTOM_ANNUAL_CATEGORIES = new Set(['Elections', 'Politics', 'Entertainment', 'Companies', 'Science and Technology', 'Financials']);
-const CUSTOM_MONTHLY_CATEGORIES = new Set(['Economics', 'Climate and Weather', 'Mentions']);
-
-const LADDER_FREQS = new Set(['weekly', 'daily', 'hourly', 'fifteen_min']);
-
-function getEffectiveFreq(rawFreq: string | undefined, category: string | undefined): string | undefined {
-  if (rawFreq !== 'custom') return rawFreq;
-  if (!category) return 'custom';
-  if (category === 'Sports') return 'daily';
-  if (CUSTOM_ANNUAL_CATEGORIES.has(category)) return 'annual';
-  if (CUSTOM_MONTHLY_CATEGORIES.has(category)) return 'monthly';
-  return 'custom';
-}
+export const RECENT_ACTIVITY_WINDOW = 14;
+export const RECENT_ACTIVITY_THRESHOLD = 5;
 
 export interface TierSnapshot {
   date: string; // YYYY-MM-DD
@@ -25,7 +14,7 @@ export interface TierSnapshot {
   consecutivePositive: number;
   moved: 'up' | 'down' | null;
   tradesToday: number;
-  active: boolean; // true if new trades closed today (ladder evaluated)
+  active: boolean;
 }
 
 export interface SeriesBacktest {
@@ -36,6 +25,7 @@ export interface SeriesBacktest {
   totalTrades: number;
   daysTracked: number;
   lastR30: number | null;
+  recentActivityDays: number;
   history: TierSnapshot[];
 }
 
@@ -75,21 +65,19 @@ function ladderDown(tier: number): number {
 }
 
 /**
- * Backtest each per-event series (weekly/daily/hourly/fifteen_min) from its first trade to today.
+ * Backtest series that are recently active (≥5 trading days in last 14 calendar days)
+ * through the 10-step ladder. No frequency labels needed — activity determines routing.
  *
  * Rules:
- *   - Starter: days 1–3 pinned at 1¢ (tier 1), counter still accumulates
- *   - Day 4+: r30 ≥ 0 three days running → +1 level, counter resets
- *            r30 < 0 any day → -1 level, counter resets
- *            r30 is null (no trades in 30d window) → hold, counter unchanged
+ *   - Starter: days 1–3 pinned at 1¢, counter still accumulates
+ *   - Day 4+: r30 ≥ 0 three active days running → +1 level, counter resets
+ *            r30 < 0 any calendar day → -1 level, counter resets
+ *            r30 null → hold
  *   - Clamped to ladder bounds [1, 200]
  */
 export function backtestTiers(
   allMatchedTrades: MatchedTrade[],
-  frequencyMap: Map<string, string>,
-  categoryMap: Map<string, string>,
 ): Map<string, SeriesBacktest> {
-  // Group trades by series
   const bySeries = new Map<string, MatchedTrade[]>();
   for (const t of allMatchedTrades) {
     const { series } = parseTickerComponents(t.Ticker);
@@ -101,18 +89,21 @@ export function backtestTiers(
   const today = startOfDay(new Date());
 
   bySeries.forEach((trades, series) => {
-    const rawFreq = frequencyMap.get(series);
-    const category = categoryMap.get(series);
-    const effectiveFreq = getEffectiveFreq(rawFreq, category);
-
-    if (!effectiveFreq || !LADDER_FREQS.has(effectiveFreq)) return;
-
-    // Sort trades by exit date ascending
     const sorted = [...trades].sort((a, b) => a.Exit_Date.getTime() - b.Exit_Date.getTime());
     const firstTradeDay = startOfDay(sorted[0].Exit_Date);
-
-    // Pre-compute each trade's exit day (truncated) for window comparisons
     const tradeDays = sorted.map(t => startOfDay(t.Exit_Date));
+
+    // Count distinct trading days in the recent activity window
+    const recentCutoff = addDays(today, -(RECENT_ACTIVITY_WINDOW - 1));
+    const recentTradeDates = new Set<string>();
+    for (const td of tradeDays) {
+      if (td.getTime() >= recentCutoff.getTime()) {
+        recentTradeDates.add(dateKey(td));
+      }
+    }
+    const recentActivityDays = recentTradeDates.size;
+
+    if (recentActivityDays < RECENT_ACTIVITY_THRESHOLD) return;
 
     const totalDays = daysBetween(firstTradeDay, today);
 
@@ -120,7 +111,6 @@ export function backtestTiers(
     let consecutive = 0;
     const history: TierSnapshot[] = [];
 
-    // Two-pointer sliding 30-day window
     let leftIdx = 0;
     let rightIdx = 0;
     let sumPnl = 0;
@@ -128,17 +118,15 @@ export function backtestTiers(
 
     for (let dayIdx = 0; dayIdx <= totalDays; dayIdx++) {
       const cursor = addDays(firstTradeDay, dayIdx);
-      const windowStart = addDays(cursor, -29); // 30-day window inclusive of cursor
+      const windowStart = addDays(cursor, -29);
 
       const rightIdxBefore = rightIdx;
-      // Add trades whose exit day is <= cursor
       while (rightIdx < sorted.length && tradeDays[rightIdx].getTime() <= cursor.getTime()) {
         sumPnl += sorted[rightIdx].Net_Profit;
         sumCost += sorted[rightIdx].Entry_Cost;
         rightIdx++;
       }
       const tradesToday = rightIdx - rightIdxBefore;
-      // Remove trades whose exit day is < windowStart
       while (leftIdx < rightIdx && tradeDays[leftIdx].getTime() < windowStart.getTime()) {
         sumPnl -= sorted[leftIdx].Net_Profit;
         sumCost -= sorted[leftIdx].Entry_Cost;
@@ -146,36 +134,27 @@ export function backtestTiers(
       }
 
       const r30 = sumCost > 0 ? sumPnl / sumCost : null;
-      const active = tradesToday > 0; // only evaluate ladder on days with new trade evidence
+      const active = tradesToday > 0;
 
       let moved: 'up' | 'down' | null = null;
       const prevTier = tier;
 
-      // Asymmetric rule:
-      //   Demotion runs on any calendar day (dormant or active) when r30 < 0 — risk signal, no new evidence needed.
-      //   Promotion runs only on active days with 3 consecutive r30 ≥ 0 readings — requires new positive evidence.
       if (dayIdx < 3) {
-        // Starter days 1–3: tier pinned at 1¢ (can't go lower), only accrue counter on active days
         if (active && r30 !== null) {
           if (r30 >= 0) consecutive += 1;
           else consecutive = 0;
         }
-        // tier remains 1
       } else {
-        // Day 4+: ladder active
         if (r30 !== null && r30 < 0) {
-          // Demote on any day with a negative r30 signal
           tier = ladderDown(tier);
           consecutive = 0;
         } else if (active && r30 !== null && r30 >= 0) {
-          // Promote only on active days with positive r30
           consecutive += 1;
           if (consecutive >= 3) {
             tier = ladderUp(tier);
             consecutive = 0;
           }
         }
-        // else (r30 null, or dormant with non-negative r30) → hold
       }
 
       if (tier > prevTier) moved = 'up';
@@ -196,12 +175,13 @@ export function backtestTiers(
     const lastSnap = history[history.length - 1];
     result.set(series, {
       series,
-      frequency: effectiveFreq,
+      frequency: 'ladder',
       firstTradeDate: dateKey(firstTradeDay),
       currentTier: tier,
       totalTrades: sorted.length,
       daysTracked: history.length,
       lastR30: lastSnap ? lastSnap.r30 : null,
+      recentActivityDays,
       history,
     });
   });

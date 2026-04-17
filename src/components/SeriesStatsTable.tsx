@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import { MatchedTrade, calculateSeriesStatsFromMatched, parseTickerComponents, SettlementResult } from '@/utils/processData';
-import { backtestTiers, summarizeTierDistribution, TIER_LADDER, SeriesBacktest } from '@/utils/tierBacktest';
+import { backtestTiers, summarizeTierDistribution, TIER_LADDER, RECENT_ACTIVITY_WINDOW, RECENT_ACTIVITY_THRESHOLD, SeriesBacktest } from '@/utils/tierBacktest';
 
 interface SeriesStatsTableProps {
   matchedTrades: MatchedTrade[];
@@ -151,8 +151,8 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     // All-time stats for tradesCount and pnl
     const allSeriesStats = calculateSeriesStatsFromMatched(allMatchedTrades);
 
-    // Run backtest for per-event (weekly/daily/hourly/fifteen_min) series
-    const backtest = backtestTiers(allMatchedTrades, frequencyMap ?? new Map(), categoryMap ?? new Map());
+    // Run activity-based backtest: ≥5 trading days in last 14 → 10-step ladder
+    const backtest = backtestTiers(allMatchedTrades);
 
     const fmtPct = (v: number) => (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
     const fmtTier = (t: number) => `${t}¢`;
@@ -161,30 +161,14 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     const toDelete: string[] = [];
     const stinkers: string[] = [];
 
-    // Per-event tier buckets (ladder). Each entry: {series, comment}
     type BucketEntry = { series: string; comment: string };
     const tierBuckets = new Map<number, BucketEntry[]>();
     TIER_LADDER.forEach(t => tierBuckets.set(t, []));
 
-    // Monthly buckets — retire NULL, top tier is now 200¢
-    const monthlyTop: BucketEntry[] = [];        // 200¢
-    const monthlyMonitoring: BucketEntry[] = []; // 100¢
-    const monthlyAggressive: BucketEntry[] = []; // 1¢
-
-    const MANUAL_ONLY = new Set(['one_off', 'annual', 'custom']);
-
-    const CUSTOM_ANNUAL_CATEGORIES = new Set(['Elections', 'Politics', 'Entertainment', 'Companies', 'Science and Technology', 'Financials']);
-    const CUSTOM_MONTHLY_CATEGORIES = new Set(['Economics', 'Climate and Weather', 'Mentions']);
-
-    const getEffectiveFreq = (rawFreq: string | undefined, series: string): string | undefined => {
-      if (rawFreq !== 'custom') return rawFreq;
-      const category = categoryMap?.get(series);
-      if (!category) return 'custom';
-      if (category === 'Sports') return 'daily';
-      if (CUSTOM_ANNUAL_CATEGORIES.has(category)) return 'annual';
-      if (CUSTOM_MONTHLY_CATEGORIES.has(category)) return 'monthly';
-      return 'custom'; // unrecognized category → manual only
-    };
+    // 3-point system for low-activity series (1¢ / 100¢ / 200¢)
+    const threePointTop: BucketEntry[] = [];        // 200¢
+    const threePointMid: BucketEntry[] = [];        // 100¢
+    const threePointLow: BucketEntry[] = [];        // 1¢
 
     allSeriesStats.forEach((stats, series) => {
       const lastDate = lastTradeDateMap.get(series);
@@ -192,73 +176,60 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       const daysSinceLast = lastDate ? (today.getTime() - lastDate.getTime()) / MS_PER_DAY : Infinity;
       const daysSinceFirst = firstDate ? (today.getTime() - firstDate.getTime()) / MS_PER_DAY : 0;
 
-      const freq = getEffectiveFreq(frequencyMap?.get(series), series);
-
-      // DELETE check — frequency-aware window
-      const deleteWindow = (() => {
-        if (!freq || MANUAL_ONLY.has(freq)) return Infinity;
-        if (freq === 'monthly') return 90;
-        if (freq === 'weekly') return 60;
-        if (freq === 'daily' || freq === 'hourly') return 30;
-        return Infinity;
-      })();
-      if (daysSinceLast > deleteWindow) {
+      // DELETE: no trades in 60+ days
+      if (daysSinceLast > 60) {
         toDelete.push(series);
         return;
       }
 
-      // one_off / annual / custom / unknown / fifteen_min — no tiers, no stinkers, manual only
-      if (!freq || MANUAL_ONLY.has(freq) || freq === 'fifteen_min') return;
+      const bt = backtest.get(series);
 
-      const r30 = sql30dMap.get(series) ?? null;
-
-      if (freq === 'monthly') {
-        // Stinker: 180+ days, 6+ trades, all-time negative
-        if (daysSinceFirst >= 180 && stats.tradesCount >= 6 && stats.pnl < 0) {
-          stinkers.push(series);
-        }
-        if (daysSinceFirst < 7) return; // too new — skip, preserve manually-set position
-        // Mentions: always 200¢ (empirical sweet spot; cliff for Mentions is at 500¢, so 200¢ is safely below)
-        if (categoryMap?.get(series) === 'Mentions') {
-          monthlyTop.push({ series, comment: 'mention pinned' });
-        } else if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
-          monthlyTop.push({ series, comment: `monthly +${r30Str(r30)}` });
-        } else if (r30 !== null && r30 < 0 && stats.tradesCount >= 2) {
-          monthlyAggressive.push({ series, comment: `monthly ${r30Str(r30)}` });
-        } else {
-          monthlyMonitoring.push({ series, comment: `<2 trades or no 30d data — hold` });
-        }
-      } else {
-        // weekly / daily / hourly / fifteen_min — use backtest
+      if (bt) {
+        // ≥5 trading days in last 14 → 10-step ladder
         if (daysSinceFirst >= 90 && stats.tradesCount >= 30 && stats.pnl < 0) {
           stinkers.push(series);
-        }
-
-        const bt = backtest.get(series);
-        if (!bt) {
-          // No backtest result (shouldn't happen given freq check) — fall back to 1¢ starter
-          tierBuckets.get(1)!.push({ series, comment: 'no backtest data — default 1¢' });
-          return;
         }
 
         const last = bt.history[bt.history.length - 1];
         let comment: string;
 
-        const daysAgo = Math.floor(daysSinceLast);
-        const lastTradeStr = daysAgo === 0 ? 'last trade today' : daysAgo === 1 ? 'last trade 1 day ago' : `last trade ${daysAgo} days ago`;
+        const todayStr = new Date().toLocaleDateString('en-CA');
+        const lastActiveSnap = [...bt.history].reverse().find(h => h.active);
+        const lastTradeDate = lastActiveSnap?.date ?? bt.history[bt.history.length - 1].date;
+        const lastTradeDaysAgo = Math.round((new Date(todayStr + 'T00:00:00').getTime() - new Date(lastTradeDate + 'T00:00:00').getTime()) / (1000 * 60 * 60 * 24));
+        const lastTradeStr = lastTradeDaysAgo === 0 ? 'last trade today' : lastTradeDaysAgo === 1 ? 'last trade yesterday' : `last trade ${lastTradeDaysAgo} days ago`;
+
+        const recentMove = [...bt.history].reverse().find(h => h.moved !== null);
+        const recentMoveDaysAgo = recentMove ? Math.round((new Date(todayStr + 'T00:00:00').getTime() - new Date(recentMove.date + 'T00:00:00').getTime()) / (1000 * 60 * 60 * 24)) : null;
 
         if (bt.daysTracked <= 3) {
-          // Still in starter window
-          comment = `starter day ${bt.daysTracked}`;
-        } else if (last.moved === 'up') {
-          comment = `↑ promoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
-        } else if (last.moved === 'down') {
-          comment = `↓ demoted from ${fmtTier(last.prevTier)} (${r30Str(last.r30)})`;
+          comment = `starter day ${bt.daysTracked} (${bt.recentActivityDays}d/14d)`;
+        } else if (recentMove && recentMoveDaysAgo !== null && recentMoveDaysAgo <= 3) {
+          const when = recentMoveDaysAgo === 0 ? 'today' : recentMoveDaysAgo === 1 ? 'yesterday' : `${recentMoveDaysAgo} days ago`;
+          const arrow = recentMove.moved === 'up' ? '↑' : '↓';
+          const verb = recentMove.moved === 'up' ? 'promoted' : 'demoted';
+          comment = `${arrow} ${verb} from ${fmtTier(recentMove.prevTier)} ${when} (${r30Str(last.r30)})`;
         } else {
           comment = `${lastTradeStr} (${r30Str(last.r30)})`;
         }
 
         tierBuckets.get(bt.currentTier)!.push({ series, comment });
+      } else {
+        // <5 trading days in last 14 → 3-point system (1¢ / 100¢ / 200¢)
+        if (daysSinceFirst >= 180 && stats.tradesCount >= 6 && stats.pnl < 0) {
+          stinkers.push(series);
+        }
+        if (daysSinceFirst < 7) return;
+
+        const r30 = sql30dMap.get(series) ?? null;
+
+        if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
+          threePointTop.push({ series, comment: `3pt: ${r30Str(r30)}` });
+        } else if (r30 !== null && r30 < 0 && stats.tradesCount >= 2) {
+          threePointLow.push({ series, comment: `3pt: ${r30Str(r30)}` });
+        } else {
+          threePointMid.push({ series, comment: `3pt: <2 trades or no 30d data` });
+        }
       }
     });
 
@@ -275,38 +246,38 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
     if (toDelete.length) {
       parts.push(
-        `-- Inactive series removed from DB (30d daily/hourly, 60d weekly, 90d monthly; one_off/annual/custom/unknown never deleted) — ${toDelete.length} series\n` +
+        `-- Inactive series (no trades in 60+ days) — ${toDelete.length} series\n` +
         `DELETE FROM one_cent_series_filters\nWHERE series_ticker IN (\n  ${toIn(toDelete)}\n);`
       );
     }
 
-    // Per-event ladder tiers, ascending 1¢ → 200¢
+    // 10-step ladder tiers (≥5 trading days in last 14), ascending 1¢ → 200¢
     TIER_LADDER.forEach(tier => {
       const bucket = tierBuckets.get(tier)!;
       if (!bucket.length) return;
       parts.push(
-        `-- ${fmtTier(tier)} tier (per-event ladder) — ${bucket.length} series\n` +
+        `-- ${fmtTier(tier)} tier (10-step ladder) — ${bucket.length} series\n` +
         `UPDATE one_cent_series_filters SET position_size_cents = ${tier} WHERE series_ticker IN (\n${emitInBlock(bucket)}\n);`
       );
     });
 
-    // Monthly tiers
-    if (monthlyTop.length) {
+    // 3-point system (<5 trading days in last 14)
+    if (threePointTop.length) {
       parts.push(
-        `-- 200¢ (monthly top) — positive 30d, 7+ days, 2+ trades — ${monthlyTop.length} series\n` +
-        `UPDATE one_cent_series_filters SET position_size_cents = 200 WHERE series_ticker IN (\n${emitInBlock(monthlyTop)}\n);`
+        `-- 200¢ (3-point: positive 30d, 2+ trades) — ${threePointTop.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 200 WHERE series_ticker IN (\n${emitInBlock(threePointTop)}\n);`
       );
     }
-    if (monthlyMonitoring.length) {
+    if (threePointMid.length) {
       parts.push(
-        `-- 100¢ (monthly monitoring / mentions / no data) — ${monthlyMonitoring.length} series\n` +
-        `UPDATE one_cent_series_filters SET position_size_cents = 100 WHERE series_ticker IN (\n${emitInBlock(monthlyMonitoring)}\n);`
+        `-- 100¢ (3-point: insufficient data) — ${threePointMid.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 100 WHERE series_ticker IN (\n${emitInBlock(threePointMid)}\n);`
       );
     }
-    if (monthlyAggressive.length) {
+    if (threePointLow.length) {
       parts.push(
-        `-- 1¢ (monthly aggressive) — negative 30d, 2+ trades — ${monthlyAggressive.length} series\n` +
-        `UPDATE one_cent_series_filters SET position_size_cents = 1 WHERE series_ticker IN (\n${emitInBlock(monthlyAggressive)}\n);`
+        `-- 1¢ (3-point: negative 30d, 2+ trades) — ${threePointLow.length} series\n` +
+        `UPDATE one_cent_series_filters SET position_size_cents = 1 WHERE series_ticker IN (\n${emitInBlock(threePointLow)}\n);`
       );
     }
 
@@ -383,7 +354,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
   const runBacktest = () => {
     if (!frequencyMap || !categoryMap) return;
-    const result = backtestTiers(allMatchedTrades, frequencyMap, categoryMap);
+    const result = backtestTiers(allMatchedTrades);
     setBacktestModal(result);
     setBacktestSelectedSeries(null);
   };
@@ -556,28 +527,28 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                 <button onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
               </div>
               <div className="px-6 py-3 border-b bg-gray-50 text-xs text-gray-600">
-                Ladder: {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}. 3 consecutive days r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢.
+                Activity-based: ≥{RECENT_ACTIVITY_THRESHOLD} trading days in last {RECENT_ACTIVITY_WINDOW} → 10-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). 3 consecutive r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢. Others → 3-point (1¢/100¢/200¢).
               </div>
-              <div className="flex-1 overflow-auto">
-                <div className="grid grid-cols-10 gap-px bg-gray-200 border-b">
-                  {distribution.map(d => (
-                    <div key={d.tier} className="bg-white px-2 py-2 text-center">
-                      <div className="text-xs text-gray-500">{d.tier === 1 ? '1¢' : `${d.tier}¢`}</div>
-                      <div className={`text-lg font-semibold ${d.count === 0 ? 'text-gray-300' : 'text-gray-900'}`}>{d.count}</div>
-                    </div>
-                  ))}
-                </div>
-                {selected ? (
-                  <div className="p-6">
+              <div className="grid grid-cols-10 gap-px bg-gray-200 border-b shrink-0">
+                {distribution.map(d => (
+                  <div key={d.tier} className="bg-white px-2 py-2 text-center">
+                    <div className="text-xs text-gray-500">{d.tier === 1 ? '1¢' : `${d.tier}¢`}</div>
+                    <div className={`text-lg font-semibold ${d.count === 0 ? 'text-gray-300' : 'text-gray-900'}`}>{d.count}</div>
+                  </div>
+                ))}
+              </div>
+              {selected ? (
+                <>
+                  <div className="px-6 pt-4 pb-2 shrink-0 border-b">
                     <button onClick={() => setBacktestSelectedSeries(null)} className="text-sm text-blue-600 hover:underline mb-3">← Back to all series</button>
                     <div className="mb-3">
                       <h4 className="text-lg font-semibold">{selected.series}</h4>
                       <div className="text-xs text-gray-500">
-                        Frequency: <span className="font-medium">{selected.frequency}</span> · First trade: {selected.firstTradeDate} · {selected.totalTrades} trades · {selected.daysTracked} days tracked · Current tier: <span className="font-semibold">{selected.currentTier === 1 ? '1¢' : `${selected.currentTier}¢`}</span>
+                        Recent activity: <span className="font-medium">{selected.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</span> · First trade: {selected.firstTradeDate} · {selected.totalTrades} trades · {selected.daysTracked} days tracked · Current tier: <span className="font-semibold">{selected.currentTier === 1 ? '1¢' : `${selected.currentTier}¢`}</span>
                       </div>
                     </div>
                     <table className="min-w-full text-xs">
-                      <thead className="bg-gray-50 sticky top-0">
+                      <thead className="bg-gray-50">
                         <tr>
                           <th className="px-3 py-2 text-left font-medium text-gray-500">Date</th>
                           <th className="px-3 py-2 text-left font-medium text-gray-500">Tier</th>
@@ -586,8 +557,12 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                           <th className="px-3 py-2 text-left font-medium text-gray-500">Move</th>
                         </tr>
                       </thead>
+                    </table>
+                  </div>
+                  <div className="flex-1 overflow-auto px-6 pb-4">
+                    <table className="min-w-full text-xs">
                       <tbody className="divide-y divide-gray-100">
-                        {selected.history.map((h, i) => (
+                        {[...selected.history].reverse().map((h, i) => (
                           <tr key={i} className={h.moved ? 'bg-yellow-50' : ''}>
                             <td className="px-3 py-1 font-mono text-gray-700">{h.date}</td>
                             <td className="px-3 py-1 font-semibold">{h.tier === 1 ? '1¢' : `${h.tier}¢`}</td>
@@ -603,37 +578,45 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                       </tbody>
                     </table>
                   </div>
-                ) : (
-                  <table className="min-w-full text-xs">
-                    <thead className="bg-gray-50 sticky top-0">
-                      <tr>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Series</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Freq</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">First Trade</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Days</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Trades</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Current Tier</th>
-                        <th className="px-3 py-2 text-left font-medium text-gray-500">Last r30</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {allSorted.map(bt => (
-                        <tr key={bt.series} className="hover:bg-blue-50 cursor-pointer" onClick={() => setBacktestSelectedSeries(bt.series)}>
-                          <td className="px-3 py-1 font-medium text-blue-700">{bt.series}</td>
-                          <td className="px-3 py-1 text-gray-500">{bt.frequency}</td>
-                          <td className="px-3 py-1 font-mono text-gray-500">{bt.firstTradeDate}</td>
-                          <td className="px-3 py-1 text-gray-500">{bt.daysTracked}</td>
-                          <td className="px-3 py-1 text-gray-500">{bt.totalTrades}</td>
-                          <td className="px-3 py-1 font-semibold">{bt.currentTier === 1 ? '1¢' : `${bt.currentTier}¢`}</td>
-                          <td className={`px-3 py-1 ${bt.lastR30 === null ? 'text-gray-300' : bt.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                            {bt.lastR30 === null ? '—' : formatPercent(bt.lastR30)}
-                          </td>
+                </>
+              ) : (
+                <>
+                  <div className="shrink-0 border-b">
+                    <table className="min-w-full text-xs">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Series</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Activity</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">First Trade</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Days</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Trades</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Current Tier</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500">Last r30</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+                      </thead>
+                    </table>
+                  </div>
+                  <div className="flex-1 overflow-auto">
+                    <table className="min-w-full text-xs">
+                      <tbody className="divide-y divide-gray-100">
+                        {allSorted.map(bt => (
+                          <tr key={bt.series} className="hover:bg-blue-50 cursor-pointer" onClick={() => setBacktestSelectedSeries(bt.series)}>
+                            <td className="px-3 py-1 font-medium text-blue-700">{bt.series}</td>
+                            <td className="px-3 py-1 text-gray-500">{bt.recentActivityDays}d/{RECENT_ACTIVITY_WINDOW}d</td>
+                            <td className="px-3 py-1 font-mono text-gray-500">{bt.firstTradeDate}</td>
+                            <td className="px-3 py-1 text-gray-500">{bt.daysTracked}</td>
+                            <td className="px-3 py-1 text-gray-500">{bt.totalTrades}</td>
+                            <td className="px-3 py-1 font-semibold">{bt.currentTier === 1 ? '1¢' : `${bt.currentTier}¢`}</td>
+                            <td className={`px-3 py-1 ${bt.lastR30 === null ? 'text-gray-300' : bt.lastR30 >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {bt.lastR30 === null ? '—' : formatPercent(bt.lastR30)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
               <div className="px-6 py-3 border-t text-xs text-gray-500 bg-gray-50">
                 Click a series to see its day-by-day tier history. Click Back to return.
               </div>
