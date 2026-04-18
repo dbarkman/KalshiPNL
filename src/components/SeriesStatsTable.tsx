@@ -169,6 +169,17 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     // All-time stats for tradesCount and pnl
     const allSeriesStats = calculateSeriesStatsFromMatched(allMatchedTrades);
 
+    // Trades per series in last 14 calendar days. Used by the 3-point system
+    // to gate promotions: no recent activity → no promotion (stale r30 guard).
+    const fourteenDaysAgo = new Date(startOfToday);
+    fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+    const trades14dCount = new Map<string, number>();
+    for (const t of allMatchedTrades) {
+      if (t.Exit_Date < fourteenDaysAgo) continue;
+      const { series } = parseTickerComponents(t.Ticker);
+      trades14dCount.set(series, (trades14dCount.get(series) ?? 0) + 1);
+    }
+
     // Given r30 and all-time stats, return the 3-point bucket tier (1/100/200).
     // Mirrors the bucket assignment below; null = too new (daysSinceFirst<7).
     const threePointTier = (r30: number | null, tradesCount: number): 1 | 100 | 200 => {
@@ -208,11 +219,18 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         return;
       }
 
-      // Crypto: quarantined. Do not emit any position UPDATE — leave whatever
-      // value is set manually in the DB. Crypto history is too messy for
-      // the ladder or 3-point system to route correctly; revisit after
-      // observing behavior at manually-set sizes for a while.
+      // Crypto quarantine (temporary — revisit next week). Crypto has messy
+      // history and keeps getting stale-r30 promotions. Force every crypto
+      // series into SQL every day as a guardrail:
+      //   - one_off / monthly / annual  → 100¢
+      //   - everything else              → 1¢
       if (categoryMap?.get(series) === 'Crypto') {
+        const freq = frequencyMap?.get(series);
+        if (freq === 'one_off' || freq === 'monthly' || freq === 'annual') {
+          threePointMid.push({ series, comment: 'crypto quarantine → 100¢' });
+        } else {
+          threePointLow.push({ series, comment: 'crypto quarantine → 1¢' });
+        }
         return;
       }
 
@@ -258,7 +276,7 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         const r30 = sql30dMap.get(series) ?? null;
 
         // Detect movement since yesterday: compare today's bucket to yesterday's.
-        const todayTier = threePointTier(r30, stats.tradesCount);
+        let todayTier = threePointTier(r30, stats.tradesCount);
         const yR30 = ySql30dMap.get(series) ?? null;
         const yStats = yAllSeriesStats.get(series);
         const yDaysSinceFirst = firstDate
@@ -268,11 +286,24 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
           ? threePointTier(yR30, yStats.tradesCount)
           : null;
 
+        // Promotion gate: require ≥1 trade in last 14 days for any UP move.
+        // Guards against stale r30 (30d window still has old positive trades
+        // but no recent activity, e.g. a series that went dormant). Demotions
+        // not gated — down-moves are risk signals.
+        const recent14d = trades14dCount.get(series) ?? 0;
+        let promotionBlocked = false;
+        if (yTier !== null && todayTier > yTier && recent14d === 0) {
+          todayTier = yTier;
+          promotionBlocked = true;
+        }
+
         let movePrefix = '';
         if (yTier !== null && yTier !== todayTier) {
           const arrow = todayTier > yTier ? '↑' : '↓';
           const verb = todayTier > yTier ? 'promoted' : 'demoted';
           movePrefix = `${arrow} ${verb} from ${yTier}¢ today · `;
+        } else if (promotionBlocked) {
+          movePrefix = `hold ${yTier}¢ (promotion blocked: no trade in 14d) · `;
         }
 
         const baseR30 = r30 !== null ? r30Str(r30) : '<2 trades or no 30d data';
