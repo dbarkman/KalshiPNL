@@ -1,6 +1,6 @@
 import { MatchedTrade, parseTickerComponents } from './processData';
 
-export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200] as const;
+export const TIER_LADDER = [1, 10, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250] as const;
 export type Tier = typeof TIER_LADDER[number];
 
 export const RECENT_ACTIVITY_WINDOW = 14;

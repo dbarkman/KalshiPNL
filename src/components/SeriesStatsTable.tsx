@@ -574,9 +574,9 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                 <button onClick={() => { setBacktestModal(null); setBacktestSelectedSeries(null); }} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
               </div>
               <div className="px-6 py-3 border-b bg-gray-50 text-xs text-gray-600">
-                Activity-based: ≥{RECENT_ACTIVITY_THRESHOLD} trading days in last {RECENT_ACTIVITY_WINDOW} → 10-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). 3 consecutive r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢. Others → 3-point (1¢/100¢/200¢).
+                Activity-based: ≥{RECENT_ACTIVITY_THRESHOLD} trading days in last {RECENT_ACTIVITY_WINDOW} → {TIER_LADDER.length}-step ladder ({TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join(' → ')}). 3 consecutive r30 ≥ 0 → +1. Any r30 &lt; 0 → -1. Days 1–3 pinned at 1¢. Others → 3-point (1¢/100¢/200¢).
               </div>
-              <div className="grid grid-cols-10 gap-px bg-gray-200 border-b shrink-0">
+              <div className="grid gap-px bg-gray-200 border-b shrink-0" style={{gridTemplateColumns: `repeat(${TIER_LADDER.length}, minmax(0, 1fr))`}}>
                 {distribution.map(d => (
                   <div key={d.tier} className="bg-white px-2 py-2 text-center">
                     <div className="text-xs text-gray-500">{d.tier === 1 ? '1¢' : `${d.tier}¢`}</div>
@@ -680,10 +680,10 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
               <button onClick={() => setSqlModal(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
             </div>
             <div className="px-6 py-2 text-xs text-gray-500 border-b bg-gray-50">
-              <span className="font-medium text-gray-700">Per-event ladder</span> (w/d/h/15m): 1¢→10→25→50→75→100→125→150→175→200¢. Days 1–3 at 1¢; then 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. Inactive days hold. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Monthly</span>: 200¢ (positive 30d + 2+ trades, or mentions pinned), 100¢ (no 30d data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">DELETE</span> — inactive 30d (daily/hourly), 60d (weekly), 90d (monthly); one_off/annual/custom never deleted. &nbsp;·&nbsp;
-              <span className="font-medium text-gray-700">Disabled stinkers</span> — 90d/30t (per-event) or 180d/6t (monthly), all-time negative (non-weather).
+              <span className="font-medium text-gray-700">{TIER_LADDER.length}-step ladder</span> (≥{RECENT_ACTIVITY_THRESHOLD}d/{RECENT_ACTIVITY_WINDOW}d active): {TIER_LADDER.map(t => t === 1 ? '1¢' : `${t}¢`).join('→')}. Days 1–3 at 1¢; 3 consecutive r30 ≥ 0 days → +1 level, any r30 &lt; 0 → -1 level. &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">3-point</span> (low activity): 200¢ (positive 30d + 2+ trades), 100¢ (insufficient data), 1¢ (negative 30d + 2+ trades). &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">DELETE</span> — no trades in 60+ days. &nbsp;·&nbsp;
+              <span className="font-medium text-gray-700">Disabled stinkers</span> — 90d/30t (ladder) or 180d/6t (3-point), all-time negative (non-weather).
             </div>
             <textarea
               readOnly
