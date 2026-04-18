@@ -148,8 +148,34 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       if (stats.totalCost > 0) sql30dMap.set(series, stats.pnl / stats.totalCost);
     });
 
+    // Yesterday's r30 (30-day window ending at end-of-yesterday). Used to detect
+    // 3-point bucket movement (promoted/demoted) since yesterday's SQL run.
+    const startOfToday = new Date(today);
+    startOfToday.setHours(0, 0, 0, 0);
+    const yesterdayWindowStart = new Date(startOfToday);
+    yesterdayWindowStart.setDate(yesterdayWindowStart.getDate() - 30);
+    const yesterday30dStats = calculateSeriesStatsFromMatched(
+      allMatchedTrades.filter(t => t.Exit_Date >= yesterdayWindowStart && t.Exit_Date < startOfToday)
+    );
+    const ySql30dMap = new Map<string, number>();
+    yesterday30dStats.forEach((stats, series) => {
+      if (stats.totalCost > 0) ySql30dMap.set(series, stats.pnl / stats.totalCost);
+    });
+    // All-time stats as of yesterday (for tradesCount / pnl in 3-point check)
+    const yAllSeriesStats = calculateSeriesStatsFromMatched(
+      allMatchedTrades.filter(t => t.Exit_Date < startOfToday)
+    );
+
     // All-time stats for tradesCount and pnl
     const allSeriesStats = calculateSeriesStatsFromMatched(allMatchedTrades);
+
+    // Given r30 and all-time stats, return the 3-point bucket tier (1/100/200).
+    // Mirrors the bucket assignment below; null = too new (daysSinceFirst<7).
+    const threePointTier = (r30: number | null, tradesCount: number): 1 | 100 | 200 => {
+      if (r30 !== null && r30 >= 0 && tradesCount >= 2) return 200;
+      if (r30 !== null && r30 < 0 && tradesCount >= 2) return 1;
+      return 100;
+    };
 
     // Run activity-based backtest: ≥5 trading days in last 14 → 10-step ladder
     const backtest = backtestTiers(allMatchedTrades);
@@ -223,12 +249,33 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
 
         const r30 = sql30dMap.get(series) ?? null;
 
-        if (r30 !== null && r30 >= 0 && stats.tradesCount >= 2) {
-          threePointTop.push({ series, comment: `3pt: ${r30Str(r30)}` });
-        } else if (r30 !== null && r30 < 0 && stats.tradesCount >= 2) {
-          threePointLow.push({ series, comment: `3pt: ${r30Str(r30)}` });
+        // Detect movement since yesterday: compare today's bucket to yesterday's.
+        const todayTier = threePointTier(r30, stats.tradesCount);
+        const yR30 = ySql30dMap.get(series) ?? null;
+        const yStats = yAllSeriesStats.get(series);
+        const yDaysSinceFirst = firstDate
+          ? (startOfToday.getTime() - firstDate.getTime()) / MS_PER_DAY
+          : 0;
+        const yTier = (yStats && yDaysSinceFirst >= 7)
+          ? threePointTier(yR30, yStats.tradesCount)
+          : null;
+
+        let movePrefix = '';
+        if (yTier !== null && yTier !== todayTier) {
+          const arrow = todayTier > yTier ? '↑' : '↓';
+          const verb = todayTier > yTier ? 'promoted' : 'demoted';
+          movePrefix = `${arrow} ${verb} from ${yTier}¢ today · `;
+        }
+
+        const baseR30 = r30 !== null ? r30Str(r30) : '<2 trades or no 30d data';
+        const comment = `${movePrefix}3pt: ${baseR30}`;
+
+        if (todayTier === 200) {
+          threePointTop.push({ series, comment });
+        } else if (todayTier === 1) {
+          threePointLow.push({ series, comment });
         } else {
-          threePointMid.push({ series, comment: `3pt: <2 trades or no 30d data` });
+          threePointMid.push({ series, comment });
         }
       }
     });
