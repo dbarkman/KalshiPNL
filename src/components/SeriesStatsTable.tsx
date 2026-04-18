@@ -208,6 +208,14 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         return;
       }
 
+      // Crypto: quarantined. Do not emit any position UPDATE — leave whatever
+      // value is set manually in the DB. Crypto history is too messy for
+      // the ladder or 3-point system to route correctly; revisit after
+      // observing behavior at manually-set sizes for a while.
+      if (categoryMap?.get(series) === 'Crypto') {
+        return;
+      }
+
       const bt = backtest.get(series);
 
       if (bt) {
