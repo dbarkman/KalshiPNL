@@ -210,10 +210,13 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
     allSeriesStats.forEach((stats, series) => {
       const lastDate = lastTradeDateMap.get(series);
       const firstDate = firstTradeDateMap.get(series);
-      const daysSinceLast = lastDate ? (today.getTime() - lastDate.getTime()) / MS_PER_DAY : Infinity;
-      const daysSinceFirst = firstDate ? (today.getTime() - firstDate.getTime()) / MS_PER_DAY : 0;
+      // Use whole-day deltas so a trade that closed 60 days ago (at any time of
+      // day) counts as exactly 60, not 60.x. Otherwise the DELETE threshold
+      // fires one day early on the boundary.
+      const daysSinceLast = lastDate ? Math.floor((startOfToday.getTime() - lastDate.getTime()) / MS_PER_DAY) : Infinity;
+      const daysSinceFirst = firstDate ? Math.floor((startOfToday.getTime() - firstDate.getTime()) / MS_PER_DAY) : 0;
 
-      // DELETE: no trades in 60+ days
+      // DELETE: no trades in more than 60 full days
       if (daysSinceLast > 60) {
         toDelete.push(series);
         return;
