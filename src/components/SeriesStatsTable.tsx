@@ -274,7 +274,10 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         if (daysSinceFirst >= 180 && stats.tradesCount >= 6 && stats.pnl < 0) {
           stinkers.push(series);
         }
-        if (daysSinceFirst < 7) return;
+        if (daysSinceFirst < 7) {
+          threePointLow.push({ series, comment: `starter day ${daysSinceFirst + 1} (${stats.tradesCount} trades, <5d/14d activity)` });
+          return;
+        }
 
         const r30 = sql30dMap.get(series) ?? null;
 
