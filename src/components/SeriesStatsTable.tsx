@@ -19,6 +19,7 @@ interface SeriesStatsTableProps {
 
 type SortField = 'series' | 'pnl' | 'proceeds' | 'cost' | 'fees' | 'trades' | 'winRate' | 'avgReturn' | 'trailing30d';
 type SortDirection = 'asc' | 'desc';
+type BacktestSortField = 'series' | 'activity' | 'firstTrade' | 'days' | 'trades' | 'currentTier' | 'lastR30';
 
 export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, allMatchedTrades, frequencyMap, categoryMap, settlementMap, selectedSeries, onSeriesSelect, seriesFilter, onSeriesFilterChange }: SeriesStatsTableProps) {
   const [sortField, setSortField] = useState<SortField>('pnl');
@@ -27,6 +28,22 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
   const [copied, setCopied] = useState(false);
   const [backtestModal, setBacktestModal] = useState<Map<string, SeriesBacktest> | null>(null);
   const [backtestSelectedSeries, setBacktestSelectedSeries] = useState<string | null>(null);
+  const [backtestSortField, setBacktestSortField] = useState<BacktestSortField>('currentTier');
+  const [backtestSortDirection, setBacktestSortDirection] = useState<SortDirection>('desc');
+
+  const handleBacktestSort = (field: BacktestSortField) => {
+    if (backtestSortField === field) {
+      setBacktestSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setBacktestSortField(field);
+      setBacktestSortDirection('desc');
+    }
+  };
+
+  const BacktestSortIcon = ({ field }: { field: BacktestSortField }) => {
+    if (backtestSortField !== field) return <span className="ml-1 text-gray-300">↕</span>;
+    return <span className="ml-1">{backtestSortDirection === 'asc' ? '↑' : '↓'}</span>;
+  };
 
   const trailing30dMap = useMemo(() => {
     const statsMap = calculateSeriesStatsFromMatched(recentMatchedTrades);
@@ -219,21 +236,6 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
       // DELETE: no trades in more than 60 full days
       if (daysSinceLast > 60) {
         toDelete.push(series);
-        return;
-      }
-
-      // Crypto quarantine (temporary — revisit next week). Crypto has messy
-      // history and keeps getting stale-r30 promotions. Force every crypto
-      // series into SQL every day as a guardrail:
-      //   - one_off / monthly / annual  → 100¢
-      //   - everything else              → 1¢
-      if (categoryMap?.get(series) === 'Crypto') {
-        const freq = frequencyMap?.get(series);
-        if (freq === 'one_off' || freq === 'monthly' || freq === 'annual') {
-          threePointMid.push({ series, comment: 'crypto quarantine → 100¢' });
-        } else {
-          threePointLow.push({ series, comment: 'crypto quarantine → 1¢' });
-        }
         return;
       }
 
@@ -608,8 +610,23 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
         const distribution = summarizeTierDistribution(backtestModal);
         const selected = backtestSelectedSeries ? backtestModal.get(backtestSelectedSeries) : null;
         const allSorted = Array.from(backtestModal.values()).sort((a, b) => {
-          if (a.currentTier !== b.currentTier) return b.currentTier - a.currentTier;
-          return a.series.localeCompare(b.series);
+          const dir = backtestSortDirection === 'asc' ? 1 : -1;
+          switch (backtestSortField) {
+            case 'series': return dir * a.series.localeCompare(b.series);
+            case 'activity': return dir * (a.recentActivityDays - b.recentActivityDays);
+            case 'firstTrade': return dir * a.firstTradeDate.localeCompare(b.firstTradeDate);
+            case 'days': return dir * (a.daysTracked - b.daysTracked);
+            case 'trades': return dir * (a.totalTrades - b.totalTrades);
+            case 'currentTier':
+              if (a.currentTier !== b.currentTier) return dir * (a.currentTier - b.currentTier);
+              return a.series.localeCompare(b.series);
+            case 'lastR30': {
+              if (a.lastR30 === null && b.lastR30 === null) return 0;
+              if (a.lastR30 === null) return 1;
+              if (b.lastR30 === null) return -1;
+              return dir * (a.lastR30 - b.lastR30);
+            }
+          }
         });
         return (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -677,13 +694,13 @@ export default function SeriesStatsTable({ matchedTrades, recentMatchedTrades, a
                     <table className="min-w-full text-xs">
                       <thead className="bg-gray-50">
                         <tr>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Series</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Activity</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">First Trade</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Days</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Trades</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Current Tier</th>
-                          <th className="px-3 py-2 text-left font-medium text-gray-500">Last r30</th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('series')}>Series<BacktestSortIcon field="series" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('activity')}>Activity<BacktestSortIcon field="activity" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('firstTrade')}>First Trade<BacktestSortIcon field="firstTrade" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('days')}>Days<BacktestSortIcon field="days" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('trades')}>Trades<BacktestSortIcon field="trades" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('currentTier')}>Current Tier<BacktestSortIcon field="currentTier" /></th>
+                          <th className="px-3 py-2 text-left font-medium text-gray-500 cursor-pointer select-none hover:bg-gray-100" onClick={() => handleBacktestSort('lastR30')}>Last r30<BacktestSortIcon field="lastR30" /></th>
                         </tr>
                       </thead>
                     </table>
